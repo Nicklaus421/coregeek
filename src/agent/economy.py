@@ -23,8 +23,10 @@ from .protocol import (
 from .state import GameState
 
 STONE_BATCH = 6
-STONE_RESERVE = 12
-SELL_BACKPACK_THRESHOLD = 60
+STONE_RESERVE = 2
+SELL_BACKPACK_THRESHOLD = 40
+SELL_ORE_THRESHOLD = 12
+DUSK_ROUND = 55
 SUMMON_ORDER_RESERVE = 150
 TOWER_LOADOUT = (GATLING, RAILGUN, ROCKET)
 _VOUCHER_TARGET = {
@@ -77,6 +79,19 @@ def worker_day(
                     turn, role, site, TOWER_LOADOUT[index], claimed, commands,
                 )
                 return
+    # 傍晚回防：天黑前必须回到基地附近操控武器
+    station = turn.station()
+    if (
+        turn.day_round >= DUSK_ROUND
+        and station is not None
+        and distance(role.pos, station.pos) > 3
+    ):
+        if builder and walls_missing and role.count(WALL_MATERIAL):
+            _build_or_walk(turn, role, walls_missing[0], WALL, claimed, commands)
+            if role.unit_id in commands:
+                return
+        _walk(turn, role, station.pos, claimed, commands)
+        return
     if builder:
         _builder_day(turn, role, walls_missing, claimed, commands)
     else:
@@ -91,12 +106,21 @@ def _builder_day(
     commands: dict[int, dict],
 ) -> None:
     stones = role.count(WALL_MATERIAL)
-    if walls_missing and stones:
+    mine = _adjacent_mine(turn, role)
+    # 攒满一批石头再去建墙，避免一块石头跑一趟
+    if walls_missing and stones and (stones >= STONE_BATCH or mine is None):
         for site in walls_missing:
             if site not in claimed:
                 _build_or_walk(turn, role, site, WALL, claimed, commands)
                 return
     _mine(turn, role, WALL_MATERIAL, STONE_BATCH, claimed, commands)
+
+
+def _adjacent_mine(turn: Turn, role: Unit) -> Pos | None:
+    for mine in turn.mines(WALL_MATERIAL):
+        if role.pos != mine and distance(role.pos, mine) <= 1:
+            return mine
+    return None
 
 
 def _trader_day(
@@ -166,17 +190,23 @@ def _sellable(
 ) -> list[tuple[str, int]]:
     result: list[tuple[str, int]] = []
     used = len(role.backpack)
+    total = 0
     for ore in ORE_TYPES:
         count = role.count(ore)
-        if not count:
-            continue
-        if ore == WALL_MATERIAL and count <= STONE_RESERVE and used < SELL_BACKPACK_THRESHOLD:
-            continue
-        sell_count = count if ore != WALL_MATERIAL else count - STONE_RESERVE
-        if sell_count <= 0:
-            continue
-        if news.spiking(ore, state) or used >= SELL_BACKPACK_THRESHOLD:
-            result.append((ore, sell_count))
+        if ore == WALL_MATERIAL:
+            count = max(0, count - STONE_RESERVE)
+        if count > 0:
+            result.append((ore, count))
+            total += count
+    if not total:
+        return []
+    urgent = (
+        used >= SELL_BACKPACK_THRESHOLD
+        or total >= SELL_ORE_THRESHOLD
+        or any(news.spiking(ore, state) for ore, _c in result)
+    )
+    if not urgent:
+        return []
     result.sort(key=lambda item: -news.forecast(item[0], state))
     return result
 

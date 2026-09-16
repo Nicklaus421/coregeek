@@ -28,6 +28,7 @@ class TaskSession:
     llm_extract_applied: bool = False
     submits: int = 0
     submitted: set[str] = field(default_factory=set)
+    searched_files: set[str] = field(default_factory=set)
 
     def reset(self) -> None:
         self.__dict__.update(TaskSession().__dict__)

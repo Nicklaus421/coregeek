@@ -12,11 +12,36 @@ from .state import GameState
 
 _EXPLORE_CMDS = (
     "pwd && ls -la",
-    "find . -maxdepth 3 -type f 2>/dev/null | head -50",
-    "find . -maxdepth 3 -type f \\( -name '*.md' -o -name '*.txt' -o -name '*.json' -o -name '*.py' \\) 2>/dev/null | head -20 | xargs -I{} sh -c 'echo === {}; head -100 {}'",
+    "ls -la /tmp /home /root 2>/dev/null",
+    "find /tmp /home /root /opt /srv /data /workspace . -maxdepth 4 -type f 2>/dev/null | head -60",
 )
 _MAX_TRANSCRIPT = 24
 _MIN_SUBMIT_ROUND = 4  # 至少探索几回合后才允许交卷
+_ACCEPT_DEADLINE = 40  # 白天超过该回合不再接新任务，保证夜晚前回家
+_FILE_RE = re.compile(
+    r"[A-Za-z_][\w.-]*\.(?:md|txt|json|csv|py|log|yaml|yml|conf|cfg|xml|html|dat|bin)"
+)
+_REFUSAL_WORDS = ("无法", "不能", "未提供", "不存在", "抱歉", "无法提取", "sorry")
+
+
+def _file_names(text: str) -> list[str]:
+    names: list[str] = []
+    for name in _FILE_RE.findall(text):
+        short = name.rsplit("/", 1)[-1]
+        if short not in names:
+            names.append(short)
+    return names
+
+
+def _is_listing(result: str) -> bool:
+    if "drwx" in result or "total " in result[:200]:
+        return True
+    lines = [ln for ln in result.splitlines() if ln.strip()]
+    if len(lines) > 8 and sum(
+        1 for ln in lines if ln.startswith(("./", "/proc", "/sys"))
+    ) > len(lines) / 2:
+        return True
+    return False
 
 
 def task_signature(text: str) -> str:
@@ -57,6 +82,8 @@ def pioneer_action(turn: Turn, state: GameState) -> dict | None:
 
 
 def _pick_point(turn: Turn):
+    if turn.day_round > _ACCEPT_DEADLINE:
+        return None
     candidates = [
         point for point in turn.task_points
         if point.is_valid and point.cooldown == 0
@@ -92,6 +119,23 @@ def _next_cmd(turn: Turn, state: GameState) -> str:
     session = state.task
     if session.pending_cmds:
         return session.pending_cmds[0]
+    # 1. 任务文本中提到的文件名 -> 全盘查找
+    names = _file_names(session.text)
+    for name in names:
+        if name not in session.searched_files:
+            session.searched_files.add(name)
+            return f"find / -name '{name}' 2>/dev/null | head -5"
+    # 2. 上一次 find 找到了路径 -> 读取内容
+    if session.transcript:
+        last_cmd, last_res = session.transcript[-1]
+        if last_cmd.startswith("find /"):
+            for line in last_res.splitlines():
+                line = line.strip()
+                if line.startswith("/") and any(
+                    line.endswith(name) for name in names
+                ):
+                    return f"cat {line}"
+    # 3. 通用探索序列
     if len(session.transcript) < len(_EXPLORE_CMDS):
         return _EXPLORE_CMDS[len(session.transcript)]
     return _task_driven_cmd(session.text)
@@ -145,14 +189,18 @@ def submit_action(turn: Turn, state: GameState) -> dict | None:
 
 
 def _extract_answer(session) -> str:
-    if not session.transcript:
-        return ""
-    result = session.transcript[-1][1]
-    lines = [
-        line for line in result.splitlines()
-        if line.strip() and not line.startswith("[")
-    ]
-    return "\n".join(lines)[:2000]
+    for _cmd, result in reversed(session.transcript):
+        lines = [
+            line for line in result.splitlines()
+            if line.strip() and not line.startswith("[")
+        ]
+        if not lines:
+            continue
+        text = "\n".join(lines)[:2000]
+        if _is_listing(text):
+            continue
+        return text
+    return ""
 
 
 def handle_answer_error(turn: Turn, state: GameState) -> None:
@@ -208,6 +256,9 @@ def apply_llm_extract(state: GameState, text: str) -> bool:
     session = state.task
     answer = text.strip()
     if not answer or len(answer) > 4000:
+        return False
+    head = answer[:80]
+    if any(word in head for word in _REFUSAL_WORDS):
         return False
     session.draft_answer = answer
     return True
