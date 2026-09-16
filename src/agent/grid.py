@@ -10,7 +10,12 @@ _STEPS = (
 )
 
 
-def next_step(turn: Turn, moving: Unit, goal: Pos) -> Pos | None:
+def next_step(
+    turn: Turn,
+    moving: Unit,
+    goal: Pos,
+    max_expansions: int = 2000,
+) -> Pos | None:
     blocked = turn.blocked(moving)
     order = count()
     frontier: list[tuple[int, int, int, Pos]] = [
@@ -20,7 +25,7 @@ def next_step(turn: Turn, moving: Unit, goal: Pos) -> Pos | None:
     best = {moving.pos: 0}
     seen: set[Pos] = set()
 
-    while frontier:
+    while frontier and len(seen) < max_expansions:
         _, cost, _, current = heappop(frontier)
         if current in seen:
             continue
@@ -45,6 +50,28 @@ def next_step(turn: Turn, moving: Unit, goal: Pos) -> Pos | None:
                     step,
                 ),
             )
+    return None
+
+
+def step_adjacent(turn: Turn, moving: Unit, goal: Pos) -> Pos | None:
+    """走向 goal 周围一格的可达空地；已经相邻则返回 None。"""
+    if distance(moving.pos, goal) <= 1 and moving.pos != goal:
+        return None
+    blocked = turn.blocked(moving)
+    stands = [
+        Pos(goal.x + dx, goal.y + dy) for dx, dy in _STEPS
+    ]
+    stands = [
+        pos for pos in stands
+        if pos == moving.pos or (turn.land(pos) and pos not in blocked)
+    ]
+    stands.sort(key=lambda pos: distance(pos, moving.pos))
+    for stand in stands:
+        if stand == moving.pos:
+            return None
+        step = next_step(turn, moving, stand)
+        if step is not None:
+            return step
     return None
 
 

@@ -1,11 +1,13 @@
 import json
 import logging
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from .brain import decide
 
 LOGGER = logging.getLogger(__name__)
+_LOCK = threading.Lock()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -14,14 +16,17 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length)
         try:
             payload = json.loads(raw.decode("utf-8"))
-            response = decide(payload)
-            LOGGER.info("round %s -> %s", payload.get("roundNo"), response)
-            body = json.dumps(
-                {"roleCommandMap": response}, ensure_ascii=False,
-            ).encode("utf-8")
+            with _LOCK:
+                response = decide(payload)
+            LOGGER.info(
+                "round %s -> %s",
+                payload.get("roundNo"),
+                response.get("roleCommandMap"),
+            )
+            body = json.dumps(response, ensure_ascii=False).encode("utf-8")
         except Exception:
             LOGGER.exception("decision failed")
-            body = b'{"roleCommandMap":{}}'
+            body = b'{"roleCommandMap":{},"prompt":"","executeCmd":""}'
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))

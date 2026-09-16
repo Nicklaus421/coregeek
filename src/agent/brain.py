@@ -1,24 +1,20 @@
+import time
 from typing import Any
 
-from .grid import next_step
+from . import combat, economy, llm, news, tasks, treasure, validate
 from .protocol import (
-    PIONEER,
     Pos,
+    Response,
     Turn,
     Unit,
-    WALL,
-    WALL_MATERIAL,
-    WEAPON_BUILD_COST,
-    attack_command,
-    build_command,
-    collect_command,
+    buy_command,
     distance,
     move_command,
     station_footprint,
 )
+from .state import blacklisted, maybe_reset, record_results, remember_cmds
 
-TOWER_LOADOUT = ("gatling", "railgun", "rocket")
-STONE_BATCH = 6
+TIME_BUDGET = 3.5
 _NEIGHBOUR_STEPS = (
     (-1, -1), (-1, 0), (-1, 1),
     (0, -1), (0, 1),
@@ -26,203 +22,188 @@ _NEIGHBOUR_STEPS = (
 )
 
 
-def decide(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+def decide(payload: dict[str, Any]) -> dict[str, Any]:
+    started = time.monotonic()
     turn = Turn.load(payload)
-    commands: dict[int, dict[str, Any]] = {}
-    if turn.is_day:
-        _day(turn, commands)
-    else:
-        _night(turn, commands)
-    return {str(key): value for key, value in commands.items()}
+    state = maybe_reset(turn)
+    record_results(turn, state)
+    resp = Response()
+    try:
+        _ingest(turn, state)
+        if turn.is_day:
+            _day(turn, state, resp)
+        else:
+            resp.commands = combat.night_commands(turn, state)
+    except Exception:
+        pass
+    _filter(turn, state, resp)
+    remember_cmds(state, resp.commands)
+    return resp.dump()
 
 
-def _day(turn: Turn, commands: dict[int, dict[str, Any]]) -> None:
+def _ingest(turn: Turn, state) -> None:
+    for code, _desc in turn.errors:
+        if code == 5:
+            llm.note_quota_error(state)
+    _safe(news.ingest, turn, state)
+    _safe(treasure.ingest_legend, turn, state)
+    _safe(treasure.handle_result, turn, state)
+    _safe(tasks.handle_answer_error, turn, state)
+    _apply_llm_resp(turn, state)
+
+
+def _apply_llm_resp(turn: Turn, state) -> None:
+    text = turn.llm_resp.strip()
+    if not text:
+        return
+    session = state.task
+    if session.llm_plan_requested and not session.llm_plan_applied:
+        if tasks.apply_llm_plan(state, text):
+            session.llm_plan_applied = True
+        return
+    if session.llm_extract_requested and not session.llm_extract_applied:
+        if tasks.apply_llm_extract(state, text):
+            session.llm_extract_applied = True
+        return
+    if state.treasure.llm_requested_day:
+        treasure.apply_llm_answer(state, text)
+
+
+def _day(turn: Turn, state, resp: Response) -> None:
     sites = _tower_sites(turn)
     order = _wall_order(turn)
     standing_towers = {unit.pos for unit in turn.weapons()}
     standing_walls = {unit.pos for unit in turn.walls()}
     occupied = turn.occupied_cells()
-    towers_missing = [pos for pos in sites if pos not in standing_towers]
+    if len(standing_towers) >= 3:
+        towers_missing = []
+    else:
+        towers_missing = [
+            pos for pos in sites
+            if pos not in standing_towers
+        ][: 3 - len(standing_towers)]
     walls_missing = [pos for pos in order if pos not in standing_walls]
     free_towers = [pos for pos in towers_missing if pos not in occupied]
     free_walls = [pos for pos in walls_missing if pos not in occupied]
 
     claimed: set[Pos] = set()
-    for role in turn.workers():
-        _worker_day(
-            turn, role, sites, free_towers, free_walls, claimed, commands,
+    pioneer = turn.pioneer()
+    if pioneer is not None:
+        _pioneer_day(turn, state, pioneer, resp)
+
+    workers = turn.workers()
+    for index, role in enumerate(workers):
+        _safe(
+            economy.worker_day,
+            turn, state, role, index == 0, sites,
+            list(free_towers), list(free_walls), claimed, resp.commands,
         )
-    for role, tower in _tower_pairs(turn):
-        if role.kind != PIONEER:
-            continue
-        if distance(role.pos, tower.pos) <= 1 and role.pos not in walls_missing:
-            continue
-        step = _step_toward(turn, role, tower.pos, claimed, inside_only=True)
-        if step is not None:
-            commands[role.unit_id] = move_command(step)
+
+    resp.execute_cmd = tasks.attach_exec(turn, state)
+    _attach_prompt(turn, state, resp)
 
 
-def _worker_day(
-    turn: Turn,
-    role: Unit,
-    sites: tuple[Pos, ...],
-    towers_missing: list[Pos],
-    walls_missing: list[Pos],
-    claimed: set[Pos],
-    commands: dict[int, dict[str, Any]],
-) -> None:
-    if towers_missing and turn.gold >= WEAPON_BUILD_COST:
-        for index, site in enumerate(sites):
-            if site in towers_missing and site not in claimed:
-                _build_or_walk(
-                    turn, role, site, TOWER_LOADOUT[index], claimed, commands,
-                )
-                return
-    if not walls_missing:
+def _pioneer_day(turn: Turn, state, pioneer: Unit, resp: Response) -> None:
+    command = _safe(tasks.pioneer_action, turn, state)
+    if command is not None:
+        resp.commands[pioneer.unit_id] = command
         return
-
-    stones = role.backpack.count(WALL_MATERIAL)
-    mine = _adjacent_mine(turn, role)
-    if mine is not None and stones < STONE_BATCH:
-        commands[role.unit_id] = collect_command(mine)
-        claimed.add(mine)
+    if state.task.active and _safe(tasks.answer_ready, turn, state):
+        resp.commands[pioneer.unit_id] = tasks.submit_action(turn, state)
         return
-    if stones:
-        for site in walls_missing:
-            if site not in claimed:
-                _build_or_walk(turn, role, site, WALL, claimed, commands)
-                return
+    if state.task.active:
         return
-    _mine(turn, role, claimed, commands)
+    command = _safe(treasure.pioneer_action, turn, state)
+    if command is not None:
+        resp.commands[pioneer.unit_id] = command
+        return
+    command = _buy_task_items(turn, state, pioneer)
+    if command is not None:
+        resp.commands[pioneer.unit_id] = command
+        return
+    _standby(turn, pioneer, resp)
 
 
-def _adjacent_mine(turn: Turn, role: Unit) -> Pos | None:
-    mines = sorted(
-        (
-            mine for mine in turn.stone_mines()
-            if role.pos != mine and distance(role.pos, mine) <= 1
-        ),
-        key=lambda pos: (distance(role.pos, pos), pos.x, pos.y),
-    )
-    return mines[0] if mines else None
+def _buy_task_items(turn: Turn, state, pioneer: Unit) -> dict | None:
+    from .grid import step_adjacent
 
-
-def _night(turn: Turn, commands: dict[int, dict[str, Any]]) -> None:
-    claimed: set[Pos] = set()
-    for role, tower in _tower_pairs(turn):
-        if distance(role.pos, tower.pos) <= 1:
-            if tower.cooldown > 0:
-                continue
-            target = _attack_target(turn, tower)
-            if target is not None:
-                commands[tower.unit_id] = attack_command(role.unit_id, target)
-            continue
-        step = _step_toward(turn, role, tower.pos, claimed)
-        if step is not None:
-            commands[role.unit_id] = move_command(step)
-
-
-def _tower_pairs(turn: Turn) -> tuple[tuple[Unit, Unit], ...]:
-    return tuple(zip(turn.controllable(), turn.weapons()))
-
-
-def _attack_target(turn: Turn, tower: Unit) -> Pos | None:
-    reach = tower.range_of_attack()
-    targets = [
-        robot for robot in turn.robots
-        if robot.health > 0 and distance(tower.pos, robot.pos) <= reach
-    ]
-    if not targets:
+    case = state.treasure
+    if case.done or not case.item_candidates:
         return None
-    nearest = min(
-        targets,
-        key=lambda robot: (distance(tower.pos, robot.pos), robot.robot_id),
-    )
-    return nearest.pos
-
-
-def _build_or_walk(
-    turn: Turn,
-    role: Unit,
-    target: Pos,
-    name: str,
-    claimed: set[Pos],
-    commands: dict[int, dict[str, Any]],
-) -> None:
-    if role.pos != target and distance(role.pos, target) <= 1:
-        commands[role.unit_id] = build_command(target, name)
-        claimed.add(target)
-        return
-    step = _step_toward(turn, role, target, claimed)
+    missing = [
+        item for item in case.item_candidates[0] if not pioneer.has(item)
+    ]
+    if not missing:
+        return None
+    shop = turn.weapon_shop()
+    if shop is None or pioneer.backpack_full:
+        return None
+    item = missing[0]
+    price = turn.shop_items.get(item)
+    if price is None or turn.gold < price:
+        return None
+    if distance(pioneer.pos, shop) <= 1:
+        return buy_command(item, 1)
+    step = step_adjacent(turn, pioneer, shop)
     if step is not None:
-        commands[role.unit_id] = move_command(step)
-
-
-def _mine(
-    turn: Turn,
-    role: Unit,
-    claimed: set[Pos],
-    commands: dict[int, dict[str, Any]],
-) -> bool:
-    if role.backpack_full:
-        return False
-    mines = sorted(
-        (pos for pos in turn.stone_mines() if pos not in claimed),
-        key=lambda pos: (distance(role.pos, pos), pos.x, pos.y),
-    )
-    for mine in mines:
-        if role.pos != mine and distance(role.pos, mine) <= 1:
-            commands[role.unit_id] = collect_command(mine)
-            claimed.add(mine)
-            return True
-        step = _step_toward(turn, role, mine, claimed)
-        if step is not None:
-            commands[role.unit_id] = move_command(step)
-            return True
-    return False
-
-
-def _step_toward(
-    turn: Turn,
-    role: Unit,
-    target: Pos,
-    claimed: set[Pos],
-    *,
-    inside_only: bool = False,
-) -> Pos | None:
-    for stand in _stand_cells(turn, role, target, claimed, inside_only):
-        if stand == role.pos:
-            return None
-        step = next_step(turn, role, stand)
-        if step is None or step in claimed:
-            continue
-        claimed.add(step)
-        return step
+        return move_command(step)
     return None
 
 
-def _stand_cells(
-    turn: Turn,
-    role: Unit,
-    target: Pos,
-    claimed: set[Pos],
-    inside_only: bool = False,
-) -> list[Pos]:
+def _standby(turn: Turn, pioneer: Unit, resp: Response) -> None:
+    from .grid import step_adjacent
+
     station = turn.station()
-    footprint = station_footprint(station.pos) if station else ()
-    blocked = turn.blocked(role)
-    cells = [
-        pos for pos in _neighbours(target)
-        if turn.land(pos)
-        and pos not in blocked
-        and (pos == role.pos or pos not in claimed)
-        and (
-            not inside_only
-            or _footprint_distance(pos, footprint) <= 1
-        )
-    ]
-    cells.sort(key=lambda pos: (_footprint_distance(pos, footprint), pos.x, pos.y))
-    return cells
+    if station is None:
+        return
+    if distance(pioneer.pos, station.pos) <= 4:
+        return
+    step = step_adjacent(turn, pioneer, station.pos)
+    if step is not None:
+        resp.commands[pioneer.unit_id] = move_command(step)
+
+
+def _attach_prompt(turn: Turn, state, resp: Response) -> None:
+    if not llm.budget_ok(turn, state):
+        return
+    session = state.task
+    if session.active:
+        if not session.llm_plan_requested and session.text:
+            resp.prompt = tasks.llm_plan_prompt(state)
+            llm.note_sent(turn, state)
+        elif (
+            len(session.transcript) >= 4
+            and not session.llm_extract_requested
+        ):
+            resp.prompt = tasks.llm_extract_prompt(state)
+            llm.note_sent(turn, state)
+        return
+    case = state.treasure
+    if (
+        not case.done
+        and case.legends
+        and (not case.loc_candidates or not case.item_candidates)
+        and case.llm_requested_day != turn.day
+    ):
+        resp.prompt = treasure.legend_prompt(state)
+        case.llm_requested_day = turn.day
+        llm.note_sent(turn, state)
+
+
+def _filter(turn: Turn, state, resp: Response) -> None:
+    filtered = validate.filter_all(turn, resp.commands)
+    resp.commands = {
+        unit_id: cmd
+        for unit_id, cmd in filtered.items()
+        if not blacklisted(unit_id, cmd, state, turn.round_no)
+    }
+
+
+def _safe(func, *args):
+    try:
+        return func(*args)
+    except Exception:
+        return None
 
 
 def _tower_sites(turn: Turn) -> tuple[Pos, ...]:
