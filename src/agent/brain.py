@@ -1,7 +1,17 @@
 import time
 from typing import Any
 
-from . import combat, economy, llm, news, tasks, trace, treasure, validate
+from . import (
+    combat,
+    economy,
+    llm,
+    logsetup,
+    news,
+    tasks,
+    trace,
+    treasure,
+    validate,
+)
 from .protocol import (
     Pos,
     Response,
@@ -44,8 +54,13 @@ def decide(payload: dict[str, Any]) -> dict[str, Any]:
         else:
             record_attack(turn, state)
             resp.commands = combat.night_commands(turn, state)
-    except Exception:
-        pass
+    except Exception as exc:
+        # 不中断决策，但必须留痕：单行、带异常类型，便于在判题器日志里定位
+        logsetup.emit(
+            f"round={turn.round_no} phase="
+            f"{'day' if turn.is_day else 'night'} "
+            f"decide_failed={type(exc).__name__}: {exc}"
+        )
     _filter(turn, state, resp)
     remember_cmds(state, resp.commands)
     dumped = resp.dump()
