@@ -22,8 +22,9 @@ from .protocol import (
 )
 from .state import GameState
 
-STONE_BATCH = 6
+STONE_BATCH = 3
 STONE_RESERVE = 2
+BUILD_NEARBY = 2
 SELL_BACKPACK_THRESHOLD = 40
 SELL_ORE_THRESHOLD = 12
 DUSK_ROUND = 55
@@ -107,8 +108,11 @@ def _builder_day(
 ) -> None:
     stones = role.count(WALL_MATERIAL)
     mine = _adjacent_mine(turn, role)
-    # 攒满一批石头再去建墙，避免一块石头跑一趟
-    if walls_missing and stones and (stones >= STONE_BATCH or mine is None):
+    # 紧缺位置的墙就在手边就立刻砌，否则攒够一批再走，避免一块石头跑一趟
+    urgent = bool(walls_missing) and (
+        mine is None or distance(role.pos, walls_missing[0]) <= BUILD_NEARBY
+    )
+    if walls_missing and stones and (urgent or stones >= STONE_BATCH):
         for site in walls_missing:
             if site not in claimed:
                 _build_or_walk(turn, role, site, WALL, claimed, commands)

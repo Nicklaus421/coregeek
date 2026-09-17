@@ -12,7 +12,14 @@ from .protocol import (
     move_command,
     station_footprint,
 )
-from .state import blacklisted, maybe_reset, record_results, remember_cmds
+from .state import (
+    attack_bearing,
+    blacklisted,
+    maybe_reset,
+    record_attack,
+    record_results,
+    remember_cmds,
+)
 
 TIME_BUDGET = 3.5
 _NEIGHBOUR_STEPS = (
@@ -33,6 +40,7 @@ def decide(payload: dict[str, Any]) -> dict[str, Any]:
         if turn.is_day:
             _day(turn, state, resp)
         else:
+            record_attack(turn, state)
             resp.commands = combat.night_commands(turn, state)
     except Exception:
         pass
@@ -70,8 +78,8 @@ def _apply_llm_resp(turn: Turn, state) -> None:
 
 
 def _day(turn: Turn, state, resp: Response) -> None:
-    sites = _tower_sites(turn)
-    order = _wall_order(turn)
+    sites = _tower_sites(turn, state)
+    order = _wall_order(turn, state)
     standing_towers = {unit.pos for unit in turn.weapons()}
     standing_walls = {unit.pos for unit in turn.walls()}
     occupied = turn.occupied_cells()
@@ -109,7 +117,9 @@ def _pioneer_day(turn: Turn, state, pioneer: Unit, resp: Response) -> None:
         resp.commands[pioneer.unit_id] = command
         return
     if state.task.active and _safe(tasks.answer_ready, turn, state):
-        resp.commands[pioneer.unit_id] = tasks.submit_action(turn, state)
+        command = _safe(tasks.submit_action, turn, state)
+        if command is not None:
+            resp.commands[pioneer.unit_id] = command
         return
     if state.task.active:
         return
@@ -168,12 +178,17 @@ def _attach_prompt(turn: Turn, state, resp: Response) -> None:
         return
     session = state.task
     if session.active:
-        if not session.llm_plan_requested and session.text:
+        if session.pending_cmds:
+            return
+        explored = len(session.transcript)
+        if not session.draft_answer and explored >= session.llm_plan_at + 2:
+            # 迭代修复：每执行两条命令就请一次 LLM 给出下一步修复动作
             resp.prompt = tasks.llm_plan_prompt(state)
             llm.note_sent(turn, state)
         elif (
-            len(session.transcript) >= 4
+            not session.draft_answer
             and not session.llm_extract_requested
+            and explored >= 8
         ):
             resp.prompt = tasks.llm_extract_prompt(state)
             llm.note_sent(turn, state)
@@ -195,7 +210,7 @@ def _filter(turn: Turn, state, resp: Response) -> None:
     resp.commands = {
         unit_id: cmd
         for unit_id, cmd in filtered.items()
-        if not blacklisted(unit_id, cmd, state, turn.round_no)
+        if cmd and not blacklisted(unit_id, cmd, state, turn.round_no)
     }
 
 
@@ -206,7 +221,7 @@ def _safe(func, *args):
         return None
 
 
-def _tower_sites(turn: Turn) -> tuple[Pos, ...]:
+def _tower_sites(turn: Turn, state) -> tuple[Pos, ...]:
     station = turn.station()
     if station is None:
         return ()
@@ -214,11 +229,27 @@ def _tower_sites(turn: Turn) -> tuple[Pos, ...]:
     cells = [
         pos for pos in _cells_at_distance(station.pos, 1) if turn.land(pos)
     ]
-    cells.sort(key=lambda pos: (_footprint_distance(pos, footprint), pos.x, pos.y))
-    return tuple(cells[:3])
+    if not cells:
+        return ()
+    bearing = _bearing(state, turn, station.pos)
+    # 面向进攻方向选第一座塔，其余两座紧邻以便同一批工人操作
+    anchor = min(
+        cells,
+        key=lambda pos: (
+            -_bearing_score(pos, station.pos, bearing),
+            _footprint_distance(pos, footprint),
+            pos.x,
+            pos.y,
+        ),
+    )
+    rest = sorted(
+        (pos for pos in cells if pos != anchor),
+        key=lambda pos: (distance(pos, anchor), pos.x, pos.y),
+    )
+    return tuple([anchor, *rest[:2]])
 
 
-def _wall_order(turn: Turn) -> tuple[Pos, ...]:
+def _wall_order(turn: Turn, state) -> tuple[Pos, ...]:
     station = turn.station()
     if station is None:
         return ()
@@ -233,10 +264,73 @@ def _wall_order(turn: Turn) -> tuple[Pos, ...]:
         *(Pos(x, ymax + 2) for x in range(xmin - 2, xmax + 3)),
         *(Pos(xmax + 2, y) for y in range(ymax + 1, ymin - 2, -1)),
     ]
-    entrance = Pos(xmax + 2, ymin - 1)
-    return tuple(
-        pos for pos in order if pos != entrance and turn.land(pos)
+    ring = list(dict.fromkeys(pos for pos in order if turn.land(pos)))
+    if not ring:
+        return ()
+    bearing = _bearing(state, turn, station.pos)
+    entrance = _pick_entrance(state, station.pos, ring, bearing)
+    walls = [pos for pos in ring if pos != entrance]
+    if bearing is not None:
+        walls.sort(
+            key=lambda pos: (
+                -_bearing_score(pos, station.pos, bearing),
+                pos.x,
+                pos.y,
+            )
+        )
+    return tuple(walls)
+
+
+_ENTRANCE_MARGIN = 0.34  # 新出口要比旧出口明显更背向敌人，避免来回改口
+
+
+def _pick_entrance(
+    state,
+    station_pos: Pos,
+    ring: list[Pos],
+    bearing: tuple[float, float] | None,
+) -> Pos:
+    """出入口留在背向进攻方向的一侧，随观测到的敌情缓慢迁移。"""
+    if bearing is None:
+        return state.wall_entrance or ring[-1]
+    candidate = min(
+        ring,
+        key=lambda pos: (_bearing_score(pos, station_pos, bearing), pos.x, pos.y),
     )
+    current = state.wall_entrance
+    if current not in ring or (
+        _bearing_score(current, station_pos, bearing)
+        > _bearing_score(candidate, station_pos, bearing) + _ENTRANCE_MARGIN
+    ):
+        state.wall_entrance = candidate
+    return state.wall_entrance
+
+
+def _bearing(state, turn: Turn, station_pos: Pos) -> tuple[float, float] | None:
+    """优先用夜间实测的进攻方向，没有实测数据时按“离地图边缘最近”先验估计。"""
+    observed = attack_bearing(state)
+    if observed is not None:
+        return observed
+    dx = station_pos.x - (turn.width - 1) / 2
+    dy = station_pos.y - (turn.height - 1) / 2
+    norm = (dx * dx + dy * dy) ** 0.5
+    if norm < 1e-6:
+        return None
+    return (dx / norm, dy / norm)
+
+
+def _bearing_score(
+    pos: Pos, station_pos: Pos, bearing: tuple[float, float] | None,
+) -> float:
+    """1 表示正对进攻方向，-1 表示完全背向。"""
+    if bearing is None:
+        return 0.0
+    dx = pos.x - station_pos.x
+    dy = pos.y - station_pos.y
+    norm = (dx * dx + dy * dy) ** 0.5
+    if norm < 1e-6:
+        return 0.0
+    return (dx * bearing[0] + dy * bearing[1]) / norm
 
 
 def _cells_at_distance(station_pos: Pos, radius: int) -> tuple[Pos, ...]:

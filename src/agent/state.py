@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .protocol import Pos, Turn
+from .protocol import Pos, Turn, distance
 
 LLM_DAILY_LIMIT = 3
 SUMMON_ORDER_DAILY_LIMIT = 10
 FAIL_BLACKLIST_ROUNDS = 10
 FAIL_THRESHOLD = 2
+ATTACK_WINDOW = 30  # 只统计基地附近该距离内的机器人，远处的不代表进攻方向
+ATTACK_NEAR = 12
 
 
 @dataclass
@@ -24,10 +26,12 @@ class TaskSession:
     draft_answer: str = ""
     llm_plan_requested: bool = False
     llm_plan_applied: bool = False
+    llm_plan_at: int = 0
     llm_extract_requested: bool = False
     llm_extract_applied: bool = False
     submits: int = 0
     submitted: set[str] = field(default_factory=set)
+    bad_answers: set[str] = field(default_factory=set)
     searched_files: set[str] = field(default_factory=set)
 
     def reset(self) -> None:
@@ -69,6 +73,8 @@ class GameState:
     sop_cache: dict[str, tuple[list[str], str]] = field(default_factory=dict)
     failed: dict[tuple[int, str], tuple[int, int]] = field(default_factory=dict)
     last_cmds: dict[int, str] = field(default_factory=dict)
+    attack_sectors: dict[tuple[int, int], int] = field(default_factory=dict)
+    wall_entrance: Pos | None = None
 
     def reset_all(self) -> None:
         legends = self.treasure.legends
@@ -96,6 +102,44 @@ def maybe_reset(turn: Turn) -> GameState:
         STATE.llm_disabled_today = False
         STATE.summon_orders_today = 0
     return STATE
+
+
+def _sign(value: int) -> int:
+    if value > 0:
+        return 1
+    if value < 0:
+        return -1
+    return 0
+
+
+def record_attack(turn: Turn, state: GameState) -> None:
+    """夜里记录机器人相对基地的来向，供白天决定修墙/建塔的位置。"""
+    station = turn.station()
+    if station is None:
+        return
+    for robot in turn.robots:
+        if robot.health <= 0:
+            continue
+        span = distance(robot.pos, station.pos)
+        if span > ATTACK_WINDOW:
+            continue
+        key = (_sign(robot.pos.x - station.pos.x), _sign(robot.pos.y - station.pos.y))
+        if key == (0, 0):
+            continue
+        weight = 3 if span <= ATTACK_NEAR else 1
+        state.attack_sectors[key] = state.attack_sectors.get(key, 0) + weight
+
+
+def attack_bearing(state: GameState) -> tuple[float, float] | None:
+    """观测到的主要进攻方向（单位向量），无数据时返回 None。"""
+    if not state.attack_sectors:
+        return None
+    x_axis = sum(dx * count for (dx, _dy), count in state.attack_sectors.items())
+    y_axis = sum(dy * count for (_dx, dy), count in state.attack_sectors.items())
+    if x_axis == 0 and y_axis == 0:
+        return None
+    norm = (x_axis * x_axis + y_axis * y_axis) ** 0.5
+    return (x_axis / norm, y_axis / norm)
 
 
 def fingerprint(unit_id: int, cmd: dict) -> str:
