@@ -32,7 +32,14 @@ class TaskSession:
     submits: int = 0
     submitted: set[str] = field(default_factory=set)
     bad_answers: set[str] = field(default_factory=set)
-    searched_files: set[str] = field(default_factory=set)
+    # 任务描述文件的绝对路径 / 其所在目录（沙盒工作区） / 文件内容
+    task_file: str = ""
+    workspace: str = ""
+    doc_text: str = ""
+    # 交卷的证据门槛：真读过任务描述、真跑过验收脚本，才允许提交答案
+    read_round: int = 0
+    ran_round: int = 0
+    json_required: bool = False  # 判题器回过"答案不是合法 JSON"
 
     def reset(self) -> None:
         self.__dict__.update(TaskSession().__dict__)
