@@ -8,8 +8,8 @@ LLM_DAILY_LIMIT = 3
 SUMMON_ORDER_DAILY_LIMIT = 10
 FAIL_BLACKLIST_ROUNDS = 10
 FAIL_THRESHOLD = 2
-ATTACK_WINDOW = 30  # 只统计基地附近该距离内的机器人，远处的不代表进攻方向
-ATTACK_NEAR = 12
+ATTACK_WINDOW = 18  # 只统计基地附近该距离内的机器人，远处的不代表进攻方向
+ATTACK_NEAR = 9
 
 
 @dataclass
@@ -75,6 +75,9 @@ class GameState:
     last_cmds: dict[int, str] = field(default_factory=dict)
     attack_sectors: dict[tuple[int, int], int] = field(default_factory=dict)
     wall_entrance: Pos | None = None
+    mine_target: dict[int, Pos] = field(default_factory=dict)  # 单位 -> 认领的矿点
+    mine_used: dict[Pos, int] = field(default_factory=dict)  # 矿点 -> 我方已采次数
+    shop_run: set[int] = field(default_factory=set)  # 正在跑"卖货+采购"行程的单位
 
     def reset_all(self) -> None:
         legends = self.treasure.legends
@@ -120,13 +123,17 @@ def record_attack(turn: Turn, state: GameState) -> None:
     for robot in turn.robots:
         if robot.health <= 0:
             continue
+        # 只统计冲我方基地来的机器人；盯着对面基地的不代表我方受敌方向
+        if robot.target_team and robot.target_team != state.my_side:
+            continue
         span = distance(robot.pos, station.pos)
         if span > ATTACK_WINDOW:
             continue
         key = (_sign(robot.pos.x - station.pos.x), _sign(robot.pos.y - station.pos.y))
         if key == (0, 0):
             continue
-        weight = 3 if span <= ATTACK_NEAR else 1
+        # 越靠近基地越能代表真实进攻方向
+        weight = (3 if span <= ATTACK_NEAR else 1)
         state.attack_sectors[key] = state.attack_sectors.get(key, 0) + weight
 
 
@@ -140,6 +147,49 @@ def attack_bearing(state: GameState) -> tuple[float, float] | None:
         return None
     norm = (x_axis * x_axis + y_axis * y_axis) ** 0.5
     return (x_axis / norm, y_axis / norm)
+
+
+def unit_vector(dx: float, dy: float) -> tuple[float, float] | None:
+    norm = (dx * dx + dy * dy) ** 0.5
+    if norm < 1e-6:
+        return None
+    return (dx / norm, dy / norm)
+
+
+def attack_direction(turn: Turn, state: GameState) -> tuple[float, float] | None:
+    """进攻方向：夜间实测 > 敌方基地方向 > 指向地图内部（远离我方最近边缘）。"""
+    observed = attack_bearing(state)
+    if observed is not None:
+        return observed
+    station = turn.station()
+    base = station.pos if station is not None else None
+    if base is None:
+        return None
+    enemy = turn.enemy_station()
+    if enemy is not None:
+        inward = unit_vector(
+            enemy.pos.x - base.x, enemy.pos.y - base.y,
+        )
+        if inward is not None:
+            return inward
+    return unit_vector(
+        (turn.width - 1) / 2 - base.x,
+        (turn.height - 1) / 2 - base.y,
+    )
+
+
+def facing_score(
+    pos: Pos, origin: Pos, bearing: tuple[float, float] | None,
+) -> float:
+    """1 表示正对进攻方向，-1 表示完全背向。"""
+    if bearing is None:
+        return 0.0
+    dx = pos.x - origin.x
+    dy = pos.y - origin.y
+    norm = (dx * dx + dy * dy) ** 0.5
+    if norm < 1e-6:
+        return 0.0
+    return (dx * bearing[0] + dy * bearing[1]) / norm
 
 
 def fingerprint(unit_id: int, cmd: dict) -> str:

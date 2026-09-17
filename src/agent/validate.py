@@ -119,6 +119,9 @@ def check(turn: Turn, unit: Unit | None, cmd: dict[str, Any]) -> bool:
         if name in _TARGETED_USE:
             if len(targets) != 1:
                 return False
+            if name.startswith("StationUpgrade"):
+                # 基地是 2x2，贴着任意一格都算够得着
+                return _near_station(turn, unit)
             if name in _VOUCHERS or name == "WallFixer":
                 return distance(unit.pos, targets[0]) <= 1
         return True
@@ -164,6 +167,15 @@ def _find(turn: Turn, raw_id: Any) -> Unit | None:
         if unit.unit_id == unit_id:
             return unit
     return None
+
+
+def _near_station(turn: Turn, unit: Unit) -> bool:
+    station = next((u for u in turn.ours if u.kind == "station"), None)
+    if station is None:
+        return False
+    return min(
+        distance(unit.pos, cell) for cell in turn.footprint(station)
+    ) <= 1
 
 
 def _near_zone(turn: Turn, unit: Unit, kind: str) -> bool:

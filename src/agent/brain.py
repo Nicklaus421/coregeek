@@ -1,7 +1,7 @@
 import time
 from typing import Any
 
-from . import combat, economy, llm, news, tasks, treasure, validate
+from . import combat, economy, llm, news, tasks, trace, treasure, validate
 from .protocol import (
     Pos,
     Response,
@@ -11,10 +11,12 @@ from .protocol import (
     distance,
     move_command,
     station_footprint,
+    use_command,
 )
 from .state import (
-    attack_bearing,
+    attack_direction,
     blacklisted,
+    facing_score,
     maybe_reset,
     record_attack,
     record_results,
@@ -46,7 +48,9 @@ def decide(payload: dict[str, Any]) -> dict[str, Any]:
         pass
     _filter(turn, state, resp)
     remember_cmds(state, resp.commands)
-    return resp.dump()
+    dumped = resp.dump()
+    trace.record(payload, dumped, (time.monotonic() - started) * 1000)
+    return dumped
 
 
 def _ingest(turn: Turn, state) -> None:
@@ -131,7 +135,30 @@ def _pioneer_day(turn: Turn, state, pioneer: Unit, resp: Response) -> None:
     if command is not None:
         resp.commands[pioneer.unit_id] = command
         return
+    command = _pioneer_upkeep(turn, pioneer)
+    if command is not None:
+        resp.commands[pioneer.unit_id] = command
+        return
     _standby(turn, pioneer, resp)
+
+
+_PIONEER_MAX_HP = 200
+
+
+def _pioneer_upkeep(turn: Turn, pioneer: Unit) -> dict | None:
+    """开拓者阵亡会直接丢掉任务分，半血就自救，顺路在商店备一份药。"""
+    if pioneer.health * 2 > _PIONEER_MAX_HP:
+        return None
+    if pioneer.has("Medicine"):
+        return use_command("Medicine")
+    shop = turn.weapon_shop()
+    price = turn.shop_items.get("Medicine")
+    if shop is None or price is None or turn.gold < price:
+        return None
+    if distance(pioneer.pos, shop) <= 1:
+        return buy_command("Medicine", 1)
+    step = step_adjacent(turn, pioneer, shop)
+    return move_command(step) if step is not None else None
 
 
 def _buy_task_items(turn: Turn, state, pioneer: Unit) -> dict | None:
@@ -307,30 +334,18 @@ def _pick_entrance(
 
 
 def _bearing(state, turn: Turn, station_pos: Pos) -> tuple[float, float] | None:
-    """优先用夜间实测的进攻方向，没有实测数据时按“离地图边缘最近”先验估计。"""
-    observed = attack_bearing(state)
-    if observed is not None:
-        return observed
-    dx = station_pos.x - (turn.width - 1) / 2
-    dy = station_pos.y - (turn.height - 1) / 2
-    norm = (dx * dx + dy * dy) ** 0.5
-    if norm < 1e-6:
-        return None
-    return (dx / norm, dy / norm)
+    """进攻方向：优先夜间实测，其次敌方基地方向，最后“指向地图内部”的先验。
+
+    机器人从远离我方最近边缘的一侧（地图内部 / 敌方基地那一角）压过来，
+    而不是从最近的边缘来；所以无实测数据时先验要指向地图中心方向。
+    """
+    return attack_direction(turn, state)
 
 
 def _bearing_score(
     pos: Pos, station_pos: Pos, bearing: tuple[float, float] | None,
 ) -> float:
-    """1 表示正对进攻方向，-1 表示完全背向。"""
-    if bearing is None:
-        return 0.0
-    dx = pos.x - station_pos.x
-    dy = pos.y - station_pos.y
-    norm = (dx * dx + dy * dy) ** 0.5
-    if norm < 1e-6:
-        return 0.0
-    return (dx * bearing[0] + dy * bearing[1]) / norm
+    return facing_score(pos, station_pos, bearing)
 
 
 def _cells_at_distance(station_pos: Pos, radius: int) -> tuple[Pos, ...]:
