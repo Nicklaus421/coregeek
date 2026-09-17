@@ -1,10 +1,8 @@
 from . import news
 from .grid import next_step, step_adjacent
 from .protocol import (
-    GATLING,
     ORE_TYPES,
     PIONEER,
-    RAILGUN,
     ROCKET,
     STATION,
     TOWER_TYPES,
@@ -38,7 +36,8 @@ DUSK_ROUND = 55
 SUMMON_ORDER_RESERVE = 150
 BOMB_THRESHOLD = 250
 STATION_HEAL_RATIO = 0.75  # 基地血量低于该比例就买升级券（升级即满血）
-TOWER_LOADOUT = (GATLING, RAILGUN, ROCKET)
+# 三座塔全用火箭发射台：射程覆盖全图、单发 20 点还带溅射，性价比最高
+TOWER_LOADOUT = (ROCKET, ROCKET, ROCKET)
 STATION_BASE_HP = 1500
 _MAX_HEALTH = {WORKER: 220, PIONEER: 200}
 # 一处矿点全图共享 10 次采集后消失；按计划采集次数摊薄路上的时间
@@ -62,19 +61,18 @@ def shopping_list(turn: Turn, state: GameState) -> list[str]:
     召唤令只是把机器人塞给对手，不产生收益，不买。
     """
     plan: list[str] = []
-    levels: dict[str, int] = {}
-    for unit in turn.weapons():
-        levels[unit.kind] = max(levels.get(unit.kind, 0), unit.level)
+    towers = turn.weapons()
     shop = turn.shop_items
     station = turn.station()
-    # 1. 三塔升级：先全体到 2 级，再冲 3 级（缺的塔还没造出来，买了券也用不了）
+    # 1. 三塔升级：先全体到 2 级，再冲 3 级（缺的塔还没造出来，买了券也用不了）。
+    #    按"当前处于该等级的塔数"买券，同型多塔各算一份，不能去重。
     for want_level, voucher in (
         (1, "WeaponUpgradeVoucher1"),
         (2, "WeaponUpgradeVoucher2"),
     ):
-        for kind in TOWER_LOADOUT:
-            if levels.get(kind) == want_level:
-                plan.append(voucher)
+        plan.extend(
+            voucher for tower in towers if tower.level == want_level
+        )
     # 2. 基地被打残：升级券 = 满血 + 提上限，直接换生存分
     if station is not None and station.health <= STATION_BASE_HP * STATION_HEAL_RATIO:
         plan.extend(["StationUpgradeVoucher1", "Medicine"])

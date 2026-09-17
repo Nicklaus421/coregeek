@@ -49,6 +49,10 @@ def decide(payload: dict[str, Any]) -> dict[str, Any]:
     resp = Response()
     try:
         _ingest(turn, state)
+        tasks.handle_turn(turn, state)
+        # 任务的两条通道（executeCmd / prompt）昼夜都要跑：任务可能横跨昼夜，
+        # 白天不推进就等于白白烧掉 60 个回合直到超时。
+        _task_channels(turn, state, resp)
         if turn.is_day:
             _day(turn, state, resp)
         else:
@@ -83,14 +87,8 @@ def _apply_llm_resp(turn: Turn, state) -> None:
     text = turn.llm_resp.strip()
     if not text:
         return
-    session = state.task
-    if session.llm_plan_requested and not session.llm_plan_applied:
-        if tasks.apply_llm_plan(state, text):
-            session.llm_plan_applied = True
-        return
-    if session.llm_extract_requested and not session.llm_extract_applied:
-        if tasks.apply_llm_extract(state, text):
-            session.llm_extract_applied = True
+    if state.task.active:
+        tasks.apply_llm_resp(turn, state, text)
         return
     if state.treasure.llm_requested_day:
         treasure.apply_llm_answer(state, text)
@@ -125,9 +123,6 @@ def _day(turn: Turn, state, resp: Response) -> None:
             turn, state, role, index == 0, sites,
             list(free_towers), list(free_walls), claimed, resp.commands,
         )
-
-    resp.execute_cmd = tasks.attach_exec(turn, state)
-    _attach_prompt(turn, state, resp)
 
 
 def _pioneer_day(turn: Turn, state, pioneer: Unit, resp: Response) -> None:
@@ -215,29 +210,20 @@ def _standby(turn: Turn, pioneer: Unit, resp: Response) -> None:
         resp.commands[pioneer.unit_id] = move_command(step)
 
 
-def _attach_prompt(turn: Turn, state, resp: Response) -> None:
+def _task_channels(turn: Turn, state, resp: Response) -> None:
+    """两条任务通道：沙盒命令（executeCmd）与 LLM 提问（prompt）。"""
+    resp.execute_cmd = tasks.attach_exec(turn, state)
     if not llm.budget_ok(turn, state):
         return
-    session = state.task
-    if session.active:
-        if session.pending_cmds:
-            return
-        explored = len(session.transcript)
-        if not session.draft_answer and explored >= session.llm_plan_at + 2:
-            # 迭代修复：每执行两条命令就请一次 LLM 给出下一步修复动作
-            resp.prompt = tasks.llm_plan_prompt(state)
-            llm.note_sent(turn, state)
-        elif (
-            not session.draft_answer
-            and not session.llm_extract_requested
-            and explored >= 8
-        ):
-            resp.prompt = tasks.llm_extract_prompt(state)
-            llm.note_sent(turn, state)
+    prompt = tasks.task_prompt(turn, state)
+    if prompt:
+        resp.prompt = prompt
+        llm.note_sent(turn, state)
         return
     case = state.treasure
     if (
-        not case.done
+        not state.task.active
+        and not case.done
         and case.legends
         and (not case.loc_candidates or not case.item_candidates)
         and case.llm_requested_day != turn.day

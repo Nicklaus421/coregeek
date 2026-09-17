@@ -5,8 +5,9 @@
 所以"要出现在最终日志里的内容"就往这里写。
 
 三条约定：
-- 每回合只输出**一行**紧凑摘要（前缀 [agent] 写进消息体里，便于 grep，
-  这样即使判题器/入口自己配了 formatter，前缀也不会丢）；
+- 每回合只输出**一行**判题器下发的 request 原文（前缀 [agent] 写进消息体里，
+  便于 grep，这样即使判题器/入口自己配了 formatter，前缀也不会丢）；
+  不额外打印任何自己推演的摘要，日志里只留判题器信息 + payload；
 - 强制行缓冲，且 logging 的 StreamHandler 每条都会 flush，
   避免进程被 kill 时块缓冲里的内容整段丢失；
 - 只用 logging，不直接 print，避免两套格式混在一起。
@@ -55,8 +56,3 @@ def emit(text: str) -> None:
         _LOGGER.info("%s %s", PREFIX, text)
     except Exception:
         pass
-
-
-def banner(text: str) -> None:
-    """启动横幅：确认"我的输出确实进了这份日志"，并报出 JSONL 路径。"""
-    emit(text)

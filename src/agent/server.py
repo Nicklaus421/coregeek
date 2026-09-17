@@ -5,7 +5,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from . import logsetup, trace
+from . import logsetup
 from .brain import decide
 
 _TRAILING_COMMA = re.compile(r",\s*([}\]])")
@@ -53,7 +53,4 @@ def _parse(raw: bytes) -> dict[str, Any]:
 
 def serve(port: int) -> None:
     logsetup.configure()
-    logsetup.banner(
-        f"listening on 0.0.0.0:{port}; trace jsonl -> {trace.path()}"
-    )
     ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()

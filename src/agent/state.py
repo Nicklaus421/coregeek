@@ -23,12 +23,12 @@ class TaskSession:
     transcript: list[tuple[str, str]] = field(default_factory=list)
     pending_cmds: list[str] = field(default_factory=list)
     last_issued: str = ""
+    last_issued_round: int = 0
     draft_answer: str = ""
-    llm_plan_requested: bool = False
-    llm_plan_applied: bool = False
-    llm_plan_at: int = 0
-    llm_extract_requested: bool = False
-    llm_extract_applied: bool = False
+    llm_plan_done: bool = False
+    check_round: int = 0
+    llm_inflight: list[tuple[str, int]] = field(default_factory=list)
+    llm_asked_round: int = 0
     submits: int = 0
     submitted: set[str] = field(default_factory=set)
     bad_answers: set[str] = field(default_factory=set)

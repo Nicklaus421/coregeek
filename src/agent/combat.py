@@ -19,14 +19,15 @@ from .validate import cone_ok
 _ROCKET_CENTER_DMG = 20
 _ROCKET_SPLASH_DMG = 10
 _GATLING_DMG = 10
-_ROCKET_MIN_GAIN = 30
+# 三塔全火箭：单发中心伤害就是 20，门槛压到 15 才能对落单的小机器人开火
+_ROCKET_MIN_GAIN = 15
 _WALL_FIX_RATIO = 0.4
 
 
 def night_commands(turn: Turn, state: GameState) -> dict[int, dict]:
     commands: dict[int, dict] = {}
     claimed: set[Pos] = set()
-    pairs = assign_controllers(turn)
+    pairs = assign_controllers(turn, _pinned(turn, state))
     for role, tower in pairs:
         if distance(role.pos, tower.pos) > 1:
             step = step_adjacent(turn, role, tower.pos)
@@ -43,8 +44,18 @@ def night_commands(turn: Turn, state: GameState) -> dict[int, dict]:
     return commands
 
 
-def assign_controllers(turn: Turn) -> tuple[tuple[Unit, Unit], ...]:
-    roles = list(turn.controllable())
+def _pinned(turn: Turn, state: GameState) -> frozenset[int]:
+    """任务期间开拓者必须钉在任务点：夜里把它调去操控武器会直接作废任务。"""
+    if not state.task.active:
+        return frozenset()
+    pioneer = turn.pioneer()
+    return frozenset({pioneer.unit_id}) if pioneer is not None else frozenset()
+
+
+def assign_controllers(
+    turn: Turn, pinned: frozenset[int] = frozenset(),
+) -> tuple[tuple[Unit, Unit], ...]:
+    roles = [role for role in turn.controllable() if role.unit_id not in pinned]
     towers = list(turn.weapons())
     pairs: list[tuple[Unit, Unit]] = []
     used: set[int] = set()
