@@ -58,13 +58,18 @@ def record(
     elapsed_ms: float,
     request_id: str = "",
 ) -> None:
-    """进最终日志的只有判题器给的 request 原文；完整 request/response 落 JSONL。
+    """进最终日志的是判题器给的 request 原文 + 我方回包；两份也都落 JSONL。
+
+    每回合两行，``req`` 是原样转存的 payload，``resp`` 是最终发出的响应
+    （含 roleCommandMap / prompt / executeCmd），便于对着日志复盘任务流程。
+    两行都是 json.dumps 的结果，换行会被转义，不会被判题器按行拆散。
 
     **整体吞异常**：日志绝对不能反过来把决策搞崩（曾因格式化报错导致整回合指令丢失）。
     """
     global _WRITTEN
     try:
-        logsetup.emit(json.dumps(payload, ensure_ascii=False))
+        logsetup.emit("req " + json.dumps(payload, ensure_ascii=False))
+        logsetup.emit("resp " + json.dumps(response, ensure_ascii=False))
     except Exception:
         pass
     if not _ENABLED:
