@@ -166,8 +166,14 @@ def _check_failed(body: str) -> bool:
 
     ``./check`` 在代码没修好时仍会打出 ``FAIL test_x`` 和一个**干扰 TOKEN**，
     那个 TOKEN 不是答案。只有没有 FAIL 标记、退出码为 0 的输出才算通过。
+
+    退出码从两处取：判题器包在开头的 ``[exitCode:N]``，以及 _check_cmd 里
+    我们自己在输出尾部打的 ``CHECK_EXIT:N``（后者专治 `| tail` 把退出码吞成 0）。
     """
     match = re.search(r"\[exitCode:\s*(-?\d+)\]", body or "")
+    if match and int(match.group(1)) != 0:
+        return True
+    match = re.search(r"CHECK_EXIT:\s*(-?\d+)", body or "")
     if match and int(match.group(1)) != 0:
         return True
     return bool(_FAIL_LINE_RE.search(_strip_exit(body)))
@@ -281,10 +287,13 @@ def _workspace_from_transcript(session) -> str | None:
 
 
 def _workdir(session) -> str | None:
+    # 任务描述文件常在父目录（task_1_alpha.md），但真正的沙盒工作区（spec.md、
+    # ./check）在它点名的 ws_N/ 子目录里。所以先从任务原文 / 执行记录里认 ws_N/，
+    # 认不到再退回任务文件所在的目录，否则 ./check 永远在错误的目录里跑。
     return (
-        session.workspace
-        or _workspace(session)
+        _workspace(session)
         or _workspace_from_transcript(session)
+        or session.workspace
     )
 
 
@@ -294,9 +303,11 @@ def _check_cmd(session) -> str | None:
     ws = _workdir(session)
     if ws is None:
         return None
+    # 末尾不再 `|| true`（那会把失败吞成退出码 0）；把真实退出码用 CHECK_EXIT
+    # 标记打在输出尾部，这样脚本只以非零退出、不打印 FAIL 行也能被判失败。
     return (
         f"cd {ws} && {{ ./check 2>&1 || sh ./check 2>&1 "
-        f"|| python3 check.py 2>&1 || true; }} | tail -40"
+        f"|| python3 check.py 2>&1; echo CHECK_EXIT:$?; }} | tail -40"
     )
 
 
