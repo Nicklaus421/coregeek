@@ -88,21 +88,29 @@ def _targets_for(turn: Turn, tower: Unit) -> list[Pos]:
     return []
 
 
-def _candidates(turn: Turn, tower: Unit) -> list[Robot]:
+def _threats(turn: Turn, tower: Unit) -> list[Robot]:
+    """射程内、存活、且正在进攻己方的机器人。
+
+    进攻敌方队伍（targetTeam != 我方）的机器人不是我们的威胁，不能拿来当目标。
+    """
     reach = tower.range_of_attack()
-    station = turn.station()
-    robots = [
+    return [
         robot for robot in turn.robots
-        if robot.health > 0 and distance(tower.pos, robot.pos) <= reach
+        if robot.health > 0
+        and distance(tower.pos, robot.pos) <= reach
+        and robot.target_team in ("", turn.my_side)
     ]
 
+
+def _candidates(turn: Turn, tower: Unit) -> list[Robot]:
+    station = turn.station()
+    robots = _threats(turn, tower)
+
     def key(robot: Robot) -> tuple:
-        hostile = robot.target_team in ("", turn.my_side)
         dist_station = (
             distance(robot.pos, station.pos) if station else 0
         )
         return (
-            not hostile,
             robot.dizzy,
             dist_station,
             -robot.score,
@@ -176,11 +184,7 @@ def _railgun_energy(tower: Unit) -> float:
 def rocket_targets(turn: Turn, tower: Unit) -> list[Pos]:
     if tower.cooldown > 0:
         return []
-    reach = tower.range_of_attack()
-    robots = [
-        robot for robot in turn.robots
-        if robot.health > 0 and distance(tower.pos, robot.pos) <= reach
-    ]
+    robots = _threats(turn, tower)
     if not robots:
         return []
     gains = _landing_gains(turn, robots)

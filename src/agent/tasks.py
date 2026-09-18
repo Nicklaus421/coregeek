@@ -94,6 +94,15 @@ _CHECK_HINT_RE = re.compile(
     r"\./(?:check|verify|grade|judge|run)\b"
     r"|(?:^|\s)(?:python3?\s+)?(?:check|verify|grade)\.[a-z]+\b"
 )
+# 验收脚本判失败的标记：输出里的 FAIL/FAILED 行。非零退出码在 _check_failed 里单独看。
+_FAIL_LINE_RE = re.compile(r"^\s*(?:FAIL|FAILED|FAILURE)\b", re.I | re.M)
+_SOURCE_EXTS = (
+    ".py", ".js", ".ts", ".mjs", ".cjs", ".go", ".java", ".c", ".cpp",
+    ".h", ".hpp", ".rb", ".rs", ".php", ".sh", ".bash", ".json", ".yaml",
+    ".yml", ".toml", ".ini", ".cfg", ".conf", ".html", ".css", ".sql",
+    ".cs", ".kt", ".swift", ".lua", ".pl", ".r",
+)
+_CHECK_NAMES = frozenset({"check", "check.py", "check.sh", "verify.py", "verify.sh"})
 _PATH_ONLY_RE = re.compile(r"^(?:[A-Za-z]:)?/[\w./+-]+$")
 _JSON_START_RE = re.compile(r"[{\[]")
 _PATH_OUT_RE = re.compile(r"^PATH:(\S+)", re.M)
@@ -152,14 +161,24 @@ def _is_listing(result: str) -> bool:
     return pathish > len(lines) * 0.8
 
 
-def _check_output(body: str) -> bool:
-    """验收脚本真打出了东西就算证据——哪怕只是一个很短的 TOKEN 行。
+def _check_failed(body: str) -> bool:
+    """验收脚本是否明确判失败：FAIL/FAILED 行，或非零退出码。
 
-    命令里串了多个备选跑法（``./check || sh ./check || python3 check.py``）时，
-    失败的备选会把输出染成"像报错"，所以只要真出现 TOKEN / JSON 就认。
+    ``./check`` 在代码没修好时仍会打出 ``FAIL test_x`` 和一个**干扰 TOKEN**，
+    那个 TOKEN 不是答案。只有没有 FAIL 标记、退出码为 0 的输出才算通过。
     """
+    match = re.search(r"\[exitCode:\s*(-?\d+)\]", body or "")
+    if match and int(match.group(1)) != 0:
+        return True
+    return bool(_FAIL_LINE_RE.search(_strip_exit(body)))
+
+
+def _check_output(body: str) -> bool:
+    """验收脚本真跑通才算证据：先排除明确失败，再认 TOKEN / JSON / 非报错。"""
     text = body.strip()
     if not text:
+        return False
+    if _check_failed(body):
         return False
     if _TOKEN_RE.search(text) or _json_blocks(text):
         return True
@@ -314,6 +333,44 @@ def _unread_docs(session) -> str | None:
             if name.endswith((".md", ".txt")) and name not in names:
                 names.append(name)
     for name in names:
+        cmd = f"cat {ws}/{name}"
+        if cmd not in done:
+            return cmd
+    return None
+
+
+def _source_names(session) -> list[str]:
+    """从 ls/find 输出里收集源码文件名（排除文档与验收脚本本身）。"""
+    names: list[str] = []
+    for cmd, result in session.transcript:
+        if not cmd.startswith(("cd ", "ls ", "find ")):
+            continue
+        for line in result.splitlines():
+            name = line.strip().rsplit(" ", 1)[-1].rsplit("/", 1)[-1]
+            if not name or name in (".", "..") or name in _CHECK_NAMES:
+                continue
+            if name.endswith(_SOURCE_EXTS) and name not in names:
+                names.append(name)
+    return names
+
+
+def _last_check_failed(session) -> bool:
+    """最近一次跑验收脚本是不是判了失败——决定要不要走"读源码 + 修复"。"""
+    for cmd, result in reversed(session.transcript):
+        if _runs_check(cmd):
+            return _check_failed(result)
+    return False
+
+
+def _unread_source(session) -> str | None:
+    """check 失败后逐份 cat 源码文件，把代码喂进 transcript 供 LLM 修复。"""
+    if not _last_check_failed(session):
+        return None
+    ws = _workdir(session)
+    if ws is None:
+        return None
+    done = {cmd for cmd, _result in session.transcript}
+    for name in _source_names(session):
         cmd = f"cat {ws}/{name}"
         if cmd not in done:
             return cmd
@@ -532,6 +589,10 @@ def _next_cmd(turn: Turn, state: GameState) -> str:
     for cmd in _chore(session):
         if cmd not in done:
             return cmd
+    # 3.5 修复循环：check 判失败后，先把源码逐份读进 transcript，再交给 LLM 修复
+    src = _unread_source(session)
+    if src is not None and src not in done:
+        return src
     # 4. 工作区还没定位到才需要全局乱翻；已经知道工作区就别浪费回合了
     if _workdir(session) is None:
         for cmd in _EXPLORE_CMDS:
@@ -699,8 +760,8 @@ def _apply_answer(state: GameState, text: str) -> bool:
 def llm_plan_prompt(state: GameState) -> str:
     session = state.task
     transcript = "\n".join(
-        f"$ {cmd}\n{(result or '(无输出)')[:600]}"
-        for cmd, result in session.transcript[-6:]
+        f"$ {cmd}\n{(result or '(无输出)')[:2500]}"
+        for cmd, result in session.transcript[-12:]
     )
     ws = _workdir(session)
     where = (
@@ -708,10 +769,18 @@ def llm_plan_prompt(state: GameState) -> str:
         f"cd {ws} && ... 的形式，不要用相对路径猜文件名。\n"
         if ws else "不要猜路径，先用 ls/find 把路径查清楚。\n"
     )
+    fix_hint = ""
+    if _last_check_failed(session):
+        fix_hint = (
+            "注意：./check 已经判出 FAIL，说明代码仍有缺陷。请先 cat 出相关源码，"
+            "定位缺陷后用 sed -i 或重定向修复，再重新跑 ./check，"
+            "直到输出里没有 FAIL 为止。\n"
+        )
     return (
         "你在一个无网络的 Linux 沙盒里用 shell 命令完成下面的比赛任务。\n"
         f"{where}"
         "命令必须真能在沙盒里跑通；需要看文件就 cat，需要改文件就 sed -i 或重定向。\n"
+        f"{fix_hint}"
         f"任务描述：\n{session.text[:1200]}\n"
         f"已执行的命令与输出：\n{transcript or '(尚未执行任何命令)'}\n"
         "请给出下一步要执行的 shell 命令，用于查看文件、修复代码、运行验收脚本，"
@@ -791,6 +860,8 @@ def _json_answer(session) -> str:
     for _cmd, result in reversed(session.transcript):
         if _echoes_task(result, session):
             continue
+        if _runs_check(_cmd) and _check_failed(result):
+            continue  # 失败验收脚本里带的 JSON/TOKEN 是干扰项，不是答案
         body = _strip_exit(result)
         blocks = _json_blocks(body)
         if not blocks and _looks_like_error(body):
@@ -839,6 +910,8 @@ def _token_answer(session) -> str:
     for _cmd, result in reversed(session.transcript):
         if _echoes_task(result, session):
             continue
+        if _runs_check(_cmd) and _check_failed(result):
+            continue  # 失败验收脚本里带的 TOKEN 是干扰项，不是答案
         for pattern in patterns:
             for found in pattern.finditer(result):
                 value = found.group(1)
