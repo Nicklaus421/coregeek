@@ -96,6 +96,43 @@ _CHECK_HINT_RE = re.compile(
 )
 _PATH_ONLY_RE = re.compile(r"^(?:[A-Za-z]:)?/[\w./+-]+$")
 _JSON_START_RE = re.compile(r"[{\[]")
+_PATH_OUT_RE = re.compile(r"^PATH:(\S+)", re.M)
+_CAT_RE = re.compile(r"\bcat\s+([^\s|;&>()<]+)")
+_LOCATE_MARK = "PATH:"
+# `-H` 跟着根目录的软链接走（/tmp -> /private/tmp 这类），
+# `$(pwd)` 而不是 `.`：命中行必须是绝对路径，沙盒的工作目录每回合可能被重置。
+_LOCATE_ROOTS = '/tmp /home /root /opt /srv /data /workspace "$(pwd)"'
+
+
+def _doc_names(text: str) -> list[str]:
+    """任务文本里提到的文件名，优先说明书（.md/.txt）——那才是任务描述。"""
+    names = _file_names(text)
+    docs = [name for name in names if name.endswith((".md", ".txt"))]
+    return docs or names
+
+
+def _locate_cmd(name: str) -> str:
+    """一条命令里同时定位任务描述文件并读出内容。
+
+    判题器每回合只执行一条命令：拆成"先 find 再 cat"要两个回合，而任务超时
+    按回合数算、完成回合越早分越高，所以这里合并。常见目录找不到再退回全盘。
+    """
+    quoted = f"'{name}'"
+    return "; ".join((
+        f"f=$(find -H {_LOCATE_ROOTS} -name {quoted} 2>/dev/null | head -1)",
+        f'[ -n "$f" ] || f=$(find -H / -name {quoted} 2>/dev/null | head -1)',
+        f'echo "{_LOCATE_MARK}$f"',
+        'cat "$f"',
+    ))
+
+
+def _cat_target(cmd: str) -> str | None:
+    """命令里真正被 cat 的文件——模型爱发 `cd X && cat Y` 这种复合命令。"""
+    for found in _CAT_RE.finditer(cmd):
+        target = found.group(1).strip("\"'")
+        if target and "$" not in target:
+            return target
+    return None
 
 
 def _strip_exit(result: str) -> str:
@@ -116,9 +153,17 @@ def _is_listing(result: str) -> bool:
 
 
 def _check_output(body: str) -> bool:
-    """验收脚本真打出了东西就算证据——哪怕只是一个很短的 TOKEN 行。"""
+    """验收脚本真打出了东西就算证据——哪怕只是一个很短的 TOKEN 行。
+
+    命令里串了多个备选跑法（``./check || sh ./check || python3 check.py``）时，
+    失败的备选会把输出染成"像报错"，所以只要真出现 TOKEN / JSON 就认。
+    """
     text = body.strip()
-    return bool(text) and not _looks_like_error(text)
+    if not text:
+        return False
+    if _TOKEN_RE.search(text) or _json_blocks(text):
+        return True
+    return not _looks_like_error(text)
 
 
 def _runs_check(cmd: str) -> bool:
@@ -225,30 +270,39 @@ def _workdir(session) -> str | None:
 
 
 def _check_cmd(session) -> str | None:
+    """跑验收脚本。一条命令里串上所有常见跑法：脚本没有执行位 / 是 python 时
+    也能一次跑通，省下"失败 -> 换个跑法再试"的回合。"""
     ws = _workdir(session)
     if ws is None:
         return None
-    return f"cd {ws} && (./check 2>&1 || true) | tail -40"
+    return (
+        f"cd {ws} && {{ ./check 2>&1 || sh ./check 2>&1 "
+        f"|| python3 check.py 2>&1 || true; }} | tail -40"
+    )
 
 
 def _chore(session) -> list[str]:
-    """自进化类任务的固定 SOP：列目录 -> 找脚本 -> 看验收脚本报错。"""
+    """自进化类任务的固定 SOP：看目录 -> 跑验收脚本看报错。"""
     ws = _workdir(session)
     if ws is None:
         return list(_DISCOVER_CMDS)
+    check = _check_cmd(session)
     return [
-        f"cd {ws} && ls -la",
-        f"cd {ws} && find . -maxdepth 3 -type f -not -path './.git/*' | head -40",
-        f"cd {ws} && (./check 2>&1 || true) | tail -40",
-        f"cd {ws} && (python3 check.py 2>&1 || true) | tail -40",
+        f"cd {ws} && ls -la && find . -maxdepth 3 -type f "
+        f"-not -path './.git/*' | head -40",
+        *(item for item in (check,) if item),
     ]
 
 
 def _unread_docs(session) -> str | None:
     """目录列表/查找结果里出现过的说明文档，逐份读一遍——用绝对路径，
-    不能再像上一局那样发 `cat task_1_alpha.md`（cwd 不对必然失败）。"""
+    不能再像上一局那样发 `cat task_1_alpha.md`（cwd 不对必然失败）。
+
+    任务描述已经读到手就不再补读：多读一份 README 要花一个回合，
+    而任务分是按完成回合算的。
+    """
     ws = _workdir(session)
-    if ws is None:
+    if ws is None or session.doc_text:
         return None
     done = {cmd for cmd, _result in session.transcript}
     names: list[str] = []
@@ -413,9 +467,10 @@ def _absorb(session, cmd: str, result: str, round_no: int) -> None:
     body = _strip_exit(result)
     if not body:
         return
-    # 1. `find <任务里的文件名>` 的命中行 -> 记下绝对路径与其所在目录
+    _absorb_locate(session, body, round_no)
+    # 1. 单独的 `find <任务里的文件名>` 命中行 -> 记下绝对路径与其所在目录
     if cmd.startswith("find ") and not _looks_like_error(body):
-        names = _file_names(session.text)
+        names = _doc_names(session.text)
         for line in body.splitlines():
             path = line.strip()
             if not path.startswith("/") or path.endswith("/"):
@@ -425,8 +480,8 @@ def _absorb(session, cmd: str, result: str, round_no: int) -> None:
                 session.workspace = path.rsplit("/", 1)[0]
                 break
     # 2. 成功读到一份说明文档 -> 这就是"真读过任务"的证据
-    if cmd.startswith("cat "):
-        target = cmd[4:].strip()
+    target = _cat_target(cmd)
+    if target is not None:
         name = target.rsplit("/", 1)[-1]
         if name.endswith((".md", ".txt")) and not _looks_like_error(body):
             if target == session.task_file or not session.doc_text:
@@ -437,20 +492,39 @@ def _absorb(session, cmd: str, result: str, round_no: int) -> None:
         session.ran_round = session.ran_round or round_no
 
 
+def _absorb_locate(session, body: str, round_no: int) -> None:
+    """解析定位命令：`PATH:<绝对路径>` 一行，其后紧跟文件内容。"""
+    match = _PATH_OUT_RE.search(body)
+    if match is None:
+        return
+    path = match.group(1)
+    if not path.startswith("/"):
+        return
+    session.task_file = path
+    session.workspace = path.rsplit("/", 1)[0]
+    if not path.endswith((".md", ".txt")):
+        return
+    doc = body[match.end():].strip()
+    if not doc or _looks_like_error(doc):
+        return
+    if not session.doc_text:
+        session.doc_text = doc
+    session.read_round = session.read_round or round_no
+
+
 def _next_cmd(turn: Turn, state: GameState) -> str:
     session = state.task
     done = {cmd for cmd, _result in session.transcript}
-    # 1. 任务文本里的文件名 -> 全盘定位，拿到绝对路径后就不用再猜 cwd 了
-    if not session.task_file:
-        for name in _file_names(session.text):
-            cmd = f"find / -name '{name}' 2>/dev/null | head -5"
+    # 1. 任务描述文件：一条命令里定位 + 读出内容（判题器每回合只回一条命令的结果）
+    if not session.read_round:
+        if session.task_file:
+            cmd = f"cat {session.task_file}"
             if cmd not in done:
                 return cmd
-    # 2. 读任务描述：必须用绝对路径（上一局的 `cat task_1_alpha.md` 就是死在这）
-    elif not session.read_round:
-        cmd = f"cat {session.task_file}"
-        if cmd not in done:
-            return cmd
+        for name in _doc_names(session.text):
+            cmd = _locate_cmd(name)
+            if cmd not in done:
+                return cmd
     # 3. 工作区：先补读还没读过的说明文档，再走固定剧本
     doc = _unread_docs(session)
     if doc is not None and doc not in done:
@@ -570,7 +644,10 @@ def _purge_inflight(session, round_no: int) -> None:
 
 
 def _as_commands(text: str) -> list[str] | None:
-    """只有"看着像 shell 命令的 JSON 字符串数组"才当命令，避免吃掉答案。"""
+    """只有"看着像 shell 命令的 JSON 数组"才当命令，避免吃掉答案。
+
+    兼容 `["cmd"]` 与 `[{"cmd": "..."}]` 两种写法——模型两种都会给。
+    """
     match = re.search(r"\[.*\]", text, re.S)
     if not match:
         return None
@@ -580,13 +657,23 @@ def _as_commands(text: str) -> list[str] | None:
         return None
     if not isinstance(items, list) or not items:
         return None
-    if not all(isinstance(item, str) for item in items):
+    cmds: list[str] = []
+    for item in items:
+        if isinstance(item, str) and item:
+            cmds.append(item)
+            continue
+        if not isinstance(item, dict):
+            continue
+        for field in ("cmd", "command", "shell", "run", "exec"):
+            value = item.get(field)
+            if isinstance(value, str) and value:
+                cmds.append(value)
+                break
+    if not cmds or any(len(cmd) > 500 for cmd in cmds):
         return None
-    if any(not item or len(item) > 500 for item in items):
+    if not any(_SHELL_HINT_RE.search(cmd) for cmd in cmds):
         return None
-    if not any(_SHELL_HINT_RE.search(item) for item in items):
-        return None
-    return items[:8]
+    return cmds[:8]
 
 
 def _apply_answer(state: GameState, text: str) -> bool:
@@ -615,14 +702,41 @@ def llm_plan_prompt(state: GameState) -> str:
         f"$ {cmd}\n{(result or '(无输出)')[:600]}"
         for cmd, result in session.transcript[-6:]
     )
+    ws = _workdir(session)
+    where = (
+        f"工作目录是 {ws}（沙盒每次都会重置），每条命令都要写成 "
+        f"cd {ws} && ... 的形式，不要用相对路径猜文件名。\n"
+        if ws else "不要猜路径，先用 ls/find 把路径查清楚。\n"
+    )
     return (
-        "你在一个无网络的 Linux 沙盒里用 shell 命令完成下面的比赛任务。"
-        "每条命令都要自带工作目录，例如：cd /path/to/ws && ls -la\n"
-        f"任务描述：\n{session.text}\n"
+        "你在一个无网络的 Linux 沙盒里用 shell 命令完成下面的比赛任务。\n"
+        f"{where}"
+        "命令必须真能在沙盒里跑通；需要看文件就 cat，需要改文件就 sed -i 或重定向。\n"
+        f"任务描述：\n{session.text[:1200]}\n"
         f"已执行的命令与输出：\n{transcript or '(尚未执行任何命令)'}\n"
         "请给出下一步要执行的 shell 命令，用于查看文件、修复代码、运行验收脚本，"
         "只输出 JSON 数组，不要解释：[\"cmd1\",\"cmd2\",...]"
     )
+
+
+def _answer_spec(session) -> str:
+    """把"答案该长什么样"写死在提示里：上一局模型直接把文件路径交了上去。"""
+    lines: list[str] = []
+    if session.json_required:
+        lines.append(
+            "重要：判题器已回告\"答案不是合法 JSON\"。这次只能输出合法 JSON 本体"
+            "（形如 {\"token\": \"...\"}），绝不能输出文件路径、目录列表或解释。"
+        )
+    key = _JSON_KEY_RE.search(f"{session.text}\n{session.doc_text}")
+    if key is not None:
+        name = key.group(1)
+        lines.append(
+            f"任务要求 JSON，键名是 \"{name}\"，请严格输出 {{\"{name}\": \"<值>\"}}。"
+            f"<值>必须是沙盒里真跑出来的结果，不能是任务描述里的占位符。"
+        )
+    if session.last_error:
+        lines.append(f"判题器最近一次反馈：{session.last_error}")
+    return "".join(line + "\n" for line in lines)
 
 
 def llm_extract_prompt(state: GameState) -> str:
@@ -637,13 +751,14 @@ def llm_extract_prompt(state: GameState) -> str:
             sorted(session.bad_answers)[:5]
         ) + "\n"
     return (
-        "任务描述：\n"
-        f"{session.text}\n"
-        "沙盒执行记录：\n"
+        "你需要提交一个比赛任务的最终答案。\n"
+        f"任务描述：\n{session.text[:1200]}\n"
+        "沙盒执行记录（这是唯一可信的信息来源）：\n"
         f"{transcript}\n"
         f"{rejected}"
-        "请提取任务要求的最终答案，只输出答案本体（若任务要求 JSON 就输出 JSON），"
-        "不要解释、不要复述任务原文、不要输出命令。"
+        f"{_answer_spec(session)}"
+        "只输出答案本体，不要解释、不要复述任务原文、不要输出命令、"
+        "不要输出文件路径或目录列表。"
     )
 
 
@@ -668,11 +783,19 @@ def _resolve_answer(session) -> str:
 
 
 def _json_answer(session) -> str:
-    """沙盒脚本常把答案当 JSON 打在输出里，取最后一段能解析的。"""
+    """沙盒脚本常把答案当 JSON 打在输出里，取最后一段能解析的。
+
+    输出里混了失败备选的报错也不能整段丢掉：只要切出了 JSON 片段就照常解析，
+    是不是答案交给 ``_json_candidate`` 把关。
+    """
     for _cmd, result in reversed(session.transcript):
-        if _echoes_task(result, session) or _looks_like_error(result):
+        if _echoes_task(result, session):
             continue
-        for block in reversed(_json_blocks(_strip_exit(result))):
+        body = _strip_exit(result)
+        blocks = _json_blocks(body)
+        if not blocks and _looks_like_error(body):
+            continue
+        for block in reversed(blocks):
             answer = _json_candidate(block, session)
             if answer:
                 return answer
@@ -781,8 +904,11 @@ def handle_answer_error(turn: Turn, state: GameState) -> None:
     if not any(code == 2 for code, _desc in turn.errors):
         return
     for code, desc in turn.errors:
+        if code != 2:
+            continue
         # 判题器会直说"答案不是合法 JSON"——记下来，后面只收 JSON
-        if code == 2 and "json" in desc.lower():
+        session.last_error = desc
+        if "json" in desc.lower():
             session.json_required = True
     if session.draft_answer:
         session.bad_answers.add(session.draft_answer)

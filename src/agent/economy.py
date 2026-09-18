@@ -108,18 +108,17 @@ def worker_day(
                 )
                 return
     _prune_mines(turn, state)
-    # 傍晚回防：天黑前必须回到基地附近操控武器
+    # 傍晚回防：天黑前必须回到基地附近操控武器。
+    # 一旦进入回防时段就一路回到底：只管"够不够近"的话，工人走到 3 格外停下、
+    # 又照常往矿点走，距离一过 4 格再往回走，就这么在天黑前反复摇摆。
     station = turn.station()
-    if (
-        turn.day_round >= DUSK_ROUND
-        and station is not None
-        and distance(role.pos, station.pos) > 3
-    ):
+    if turn.day_round >= DUSK_ROUND and station is not None:
         if builder and walls_missing and role.count(WALL_MATERIAL):
             _build_or_walk(turn, role, walls_missing[0], WALL, claimed, commands)
             if role.unit_id in commands:
                 return
-        _walk(turn, role, station.pos, claimed, commands)
+        if distance(role.pos, station.pos) > 3:
+            _walk(turn, role, station.pos, claimed, commands)
         return
     if builder:
         _builder_day(turn, state, role, walls_missing, claimed, commands)
@@ -218,13 +217,24 @@ def _trader_day(
     vendor = turn.vendor()
     running = role.unit_id in state.shop_run
     sellable = _sellable(turn, state, role)
-    if sellable and vendor is not None and (running or _trip_needed(turn, state, role)):
+    if not running and sellable and vendor is not None and _trip_needed(turn, state, role):
+        # 决定跑一趟就先认领行程：之后哪怕被同伴挡一下也别改道，
+        # 否则就是"去小贩 -> 被挡 -> 回去挖矿 -> 又想去小贩"的来回摇。
         state.shop_run.add(role.unit_id)
+        running = True
+    if running and vendor is not None and sellable:
         if distance(role.pos, vendor) <= 1:
             name, num = sellable[0]
             commands[role.unit_id] = sell_command(name, num)
             return
-        if _walk(turn, role, vendor, claimed, commands):
+        step = step_adjacent(turn, role, vendor)
+        if step is None:
+            state.shop_run.discard(role.unit_id)  # 走不到小贩，放弃这趟行程
+        elif step in claimed:
+            return  # 落脚点被占：原地等一回合，不改道
+        else:
+            claimed.add(step)
+            commands[role.unit_id] = move_command(step)
             return
     if running:
         if _shop_errand(turn, state, role, claimed, commands):
@@ -278,8 +288,28 @@ def _shop_errand(
     return _walk(turn, role, shop, claimed, commands)
 
 
+ORE_SWITCH_MARGIN = 1.2  # 新矿要明显更值才改主意，否则原地把这条矿脉挖完
+
+
+def _committed_mine(
+    turn: Turn, state: GameState, role: Unit,
+) -> tuple[str, Pos] | None:
+    """仍在认领中的矿点及其矿种；矿点消失或快挖空了就作废。"""
+    mine = state.mine_target.get(role.unit_id)
+    if mine is None or _remaining(state, mine) <= 1:
+        return None
+    for ore in ORE_TYPES:
+        if mine in turn.mines(ore):
+            return ore, mine
+    return None
+
+
 def _ore_choice(turn: Turn, state: GameState, role: Unit) -> str:
-    """按“单位时间收益”选矿：收益高但太远的矿，摊上路上时间后往往不如近矿。"""
+    """按“单位时间收益”选矿：收益高但太远的矿，摊上路上时间后往往不如近矿。
+
+    一旦认领了某条矿脉就带迟滞：只有别的矿明显更值（差 ORE_SWITCH_MARGIN 倍）
+    才改采，否则光靠收益函数的小幅波动就会让工人在两条矿脉之间来回折返。
+    """
     best_ore, best_value = WALL_MATERIAL, -1.0
     for ore in ORE_TYPES:
         mine = _pick_mine(turn, state, role, ore)
@@ -288,6 +318,12 @@ def _ore_choice(turn: Turn, state: GameState, role: Unit) -> str:
         value = _amortized(state, ore, role.pos, mine)
         if value > best_value:
             best_ore, best_value = ore, value
+    committed = _committed_mine(turn, state, role)
+    if committed is not None:
+        ore, mine = committed
+        held = _amortized(state, ore, role.pos, mine)
+        if ore == best_ore or held * ORE_SWITCH_MARGIN >= best_value:
+            return ore
     return best_ore
 
 
@@ -466,7 +502,21 @@ def _mine(
         commands[role.unit_id] = collect_command(mine)
         claimed.add(mine)
         return True
-    for mine in _mine_candidates(turn, state, role, ore):
+    candidates = _mine_candidates(turn, state, role, ore)
+    committed = state.mine_target.get(role.unit_id)
+    if candidates and committed is not None and candidates[0] == committed:
+        # 认领的矿点还在，就只朝它走。落脚点被同伴占住时宁可这回合不发布命令，
+        # 也不要改道去更远的矿——下一回合又得折回来，工人就在路上来回摇。
+        step = step_adjacent(turn, role, committed)
+        if step is None:
+            state.mine_target.pop(role.unit_id, None)  # 走不到就放弃，让下回合重挑
+            return False
+        if step in claimed:
+            return False
+        claimed.add(step)
+        commands[role.unit_id] = move_command(step)
+        return True
+    for mine in candidates:
         if _walk(turn, role, mine, claimed, commands):
             state.mine_target[role.unit_id] = mine
             return True

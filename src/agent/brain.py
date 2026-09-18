@@ -298,15 +298,18 @@ def _wall_order(turn: Turn, state) -> tuple[Pos, ...]:
     bearing = _bearing(state, turn, station.pos)
     entrance = _pick_entrance(state, station.pos, ring, bearing)
     walls = [pos for pos in ring if pos != entrance]
-    if bearing is not None:
-        walls.sort(
-            key=lambda pos: (
-                -_bearing_score(pos, station.pos, bearing),
-                pos.x,
-                pos.y,
-            )
-        )
-    return tuple(walls)
+    if not walls or bearing is None:
+        return tuple(walls)
+    # 从最迎敌的那段起，沿环**单向**连续砌下去。上一版按朝向把整圈重新排序，
+    # 相邻两次施工常常落在圈的两端，工人就在基地两头来回跑。
+    scores = [_bearing_score(pos, station.pos, bearing) for pos in walls]
+    span = len(walls)
+    anchor = max(
+        range(span), key=lambda i: (scores[i], -walls[i].x, -walls[i].y),
+    )
+    # 往迎敌的那一侧先走，保证暴露面先补齐
+    step = -1 if scores[(anchor - 1) % span] >= scores[(anchor + 1) % span] else 1
+    return tuple(walls[(anchor + step * index) % span] for index in range(span))
 
 
 _ENTRANCE_MARGIN = 0.34  # 新出口要比旧出口明显更背向敌人，避免来回改口

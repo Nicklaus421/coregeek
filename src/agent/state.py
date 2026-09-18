@@ -40,6 +40,7 @@ class TaskSession:
     read_round: int = 0
     ran_round: int = 0
     json_required: bool = False  # 判题器回过"答案不是合法 JSON"
+    last_error: str = ""  # 判题器最近一次判错的原话，回灌给大模型
 
     def reset(self) -> None:
         self.__dict__.update(TaskSession().__dict__)
