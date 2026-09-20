@@ -46,9 +46,9 @@ class Agent:
 
         # 自进化任务：白天主动接取/推进；夜晚仅在任务进行中继续提交/执行沙盒
         if game.is_night and not game.phase_task:
-            task_cmd, execute_cmd = None, None
+            task_cmd, execute_cmd, prompt = None, None, ""
         else:
-            task_cmd, execute_cmd = self.task_engine.step(game)
+            task_cmd, execute_cmd, prompt = self.task_engine.step(game)
 
         role_command_map: dict[str, dict] = {str(k): v for k, v in cmds.items()}
         if task_cmd is not None and game.pioneer is not None:
@@ -56,7 +56,7 @@ class Agent:
 
         return {
             "roleCommandMap": role_command_map,
-            "prompt": "",
+            "prompt": prompt or "",
             "executeCmd": execute_cmd or "",
         }
 

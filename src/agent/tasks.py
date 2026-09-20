@@ -1,11 +1,15 @@
-"""自进化类任务引擎。
+"""自进化类任务引擎（LLM 驱动）。
 
-开拓者前往任务点接取自进化任务，通过沙盒 ``executeCmd`` 与 ``lastCmdResult`` 多回合交互，
-真跑出答案后再 ``submitAnswer``。
+与判题器的完整交互闭环：
 
-重要约束（来自对战经验）：
-- 绝不提交任务原文、shell 报错、占位符充当答案；
-- 拿不到真实答案就不交卷。
+1. 开拓者 ``acceptTask`` 领取任务。
+2. 下一回合 ``req.phaseTask`` 描述任务（通常是"读取 xxx.md 文档"）。
+3. 通过 ``executeCmd`` 在沙盒里读取 xxx.md，结果经下一回合 ``lastCmdResult`` 返回。
+4. 把任务描述 + 已收集信息通过 ``resp.prompt`` 交给判题器大模型，结果经下一回合 ``llmResp`` 返回。
+5. 根据 ``llmResp`` 决定：执行命令（``executeCmd``）或提交答案（``submitAnswer``）。
+6. 命令结果逐回合累积，循环 prompt → 命令/答案，直到得到最终答案提交。
+
+约束：绝不提交任务原文、shell 报错、占位符充当答案；拿不到真实答案就不交卷。
 """
 from __future__ import annotations
 
@@ -15,21 +19,37 @@ from . import geometry as geo
 from .models import Pos, Role
 from .state import GameState
 
-# 沙盒探测命令序列（每回合执行一条，结果下一回合经 lastCmdResult 返回）。
-_EXPLORE_CMDS = (
-    "pwd && ls -la",
-    "find . -maxdepth 3 -type f 2>/dev/null",
-    "cat README* 2>/dev/null; cat *.md 2>/dev/null; cat *.txt 2>/dev/null; cat task* 2>/dev/null",
-    "ls -la; test -x ./check && ./check || (test -f ./check && bash ./check || true)",
-    "ls -la; for f in *.py; do echo \"== $f ==\"; cat \"$f\"; done 2>/dev/null",
+_PROMPT_TEMPLATE = """你是《未来战争》游戏里的一个 Agent，需要通过沙盒环境完成一个任务。
+
+请根据下面的【任务】与【已收集信息】决定下一步操作，并严格按以下格式回复（二选一，不要输出其他任何内容）：
+
+需要执行 shell 命令时：
+ACTION=CMD
+COMMAND=<要执行的命令>
+
+已经得到最终答案时：
+ACTION=ANSWER
+ANSWER=<最终答案>
+
+【任务】
+{task}
+
+【已收集信息】
+{context}
+"""
+
+_CMD_PREFIXES = (
+    "ls", "cat", "cd", "find", "grep", "python", "echo", "./", "bash", "sh ",
+    "pwd", "head", "tail", "sed", "awk", "test", "which", "for ", "if ",
+    "mkdir", "touch", "curl", "wget", "pip",
 )
 
 
 def _plausible(answer: str, phase_task: str) -> bool:
-    """出站合法性：必须是看起来真实解出的答案。"""
+    """出站合法性：必须是看起来真实解出的答案，而非任务原文/报错/占位符。"""
     if not answer:
         return False
-    a = answer.strip()
+    a = answer.strip().strip('"').strip("'").strip()
     if not a:
         return False
     if a == phase_task.strip():
@@ -44,90 +64,184 @@ def _plausible(answer: str, phase_task: str) -> bool:
     return True
 
 
-def _extract_answer(cmd_result: str) -> str | None:
-    """从 ``[exitCode:N]\\n<output>`` 结果中提取候选答案。
+def _extract_md_filename(phase_task: str) -> str | None:
+    m = re.search(r"([\w\-\./]+\.md)", phase_task)
+    return m.group(1) if m else None
 
-    优先识别常见的 TOKEN / JSON 字段，否则取最后一行非控制输出。
-    """
-    if not cmd_result:
-        return None
-    lines = [ln.strip() for ln in cmd_result.splitlines() if ln.strip()]
-    # 去掉 [exitCode:...]、[TRUNCATED]、[TIMEOUT]、[JUDGER_ERROR] 等控制行
-    lines = [ln for ln in lines if not ln.startswith("[")]
 
-    if not lines:
-        return None
+def _looks_like_command(text: str) -> bool:
+    t = text.strip().strip("`").strip()
+    if not t:
+        return False
+    first = t.splitlines()[0].strip()
+    return any(first.startswith(p) for p in _CMD_PREFIXES)
 
-    # 尝试识别 token / answer 字段
-    for ln in lines:
-        m = re.search(r"(?:token|answer|result|key)\s*[:=]\s*[\"']?([A-Za-z0-9_\-\.]+)", ln, re.I)
-        if m:
-            return m.group(1)
 
-    return lines[-1]
+def _parse_llm(text: str) -> tuple[str | None, str | None]:
+    """解析大模型回复，返回 (command, answer)，二者其一非 None。"""
+    if not text:
+        return None, None
+    t = text.strip()
+
+    # 1. 我们 prompt 里要求的显式 ACTION 标记
+    if re.search(r"ACTION\s*=\s*CMD", t, re.I):
+        m = re.search(r"COMMAND\s*=\s*(.+?)(?=\n\s*\n|\Z)", t, re.I | re.S)
+        return (m.group(1).strip() if m else None), None
+    if re.search(r"ACTION\s*=\s*ANSWER", t, re.I):
+        m = re.search(r"ANSWER\s*=\s*(.+?)(?=\n\s*\n|\Z)", t, re.I | re.S)
+        return None, (m.group(1).strip() if m else None)
+
+    # 2. 常见答案标记
+    m = re.search(r"(?:最终答案|答案)\s*[:：]\s*(.+)", t, re.I | re.S)
+    if m:
+        return None, m.group(1).strip()
+    m = re.search(r"ANSWER\s*[:=]\s*(.+)", t, re.I | re.S)
+    if m:
+        return None, m.group(1).strip()
+
+    # 3. 常见命令标记
+    m = re.search(r"(?:COMMAND|CMD|命令)\s*[:=：]\s*(.+)", t, re.I | re.S)
+    if m:
+        return m.group(1).strip(), None
+
+    # 4. 启发式回退：像命令 → 命令，否则 → 答案
+    if _looks_like_command(t):
+        return t, None
+    return None, t
 
 
 class TaskEngine:
     """开拓者任务状态机（跨回合持久）。"""
 
+    IDLE = "idle"
+    READ_DOC = "read_doc"      # 下一动作：读取 xxx.md
+    WAIT_DOC = "wait_doc"      # 已发 executeCmd 读文档，等 lastCmdResult
+    WAIT_LLM = "wait_llm"      # 已发 prompt，等 llmResp
+    WAIT_CMD = "wait_cmd"      # 已发 executeCmd，等 lastCmdResult
+    DONE = "done"              # 已提交答案
+
     def __init__(self) -> None:
-        self.explore_idx = 0
+        self.mode = self.IDLE
+        self.task_desc = ""
+        self.history: list[tuple[str, str]] = []
+        self.pending_cmd: str | None = None
         self.answer: str | None = None
-        self.submitted: bool = False
 
     def reset(self) -> None:
-        self.explore_idx = 0
+        self.mode = self.IDLE
+        self.task_desc = ""
+        self.history = []
+        self.pending_cmd = None
         self.answer = None
-        self.submitted = False
 
-    def step(self, game: GameState) -> tuple[dict | None, str | None]:
-        """返回 (开拓者指令, executeCmd)。指令为 None 表示本回合不动开拓者。"""
+    def step(self, game: GameState) -> tuple[dict | None, str | None, str]:
+        """返回 (开拓者指令, executeCmd, prompt)。"""
         pioneer = game.pioneer
         if pioneer is None:
-            return None, None
-
+            return None, None, ""
         phase = game.phase_task
 
-        # 无任务进行中
+        # 无任务进行中：前往接取
         if not phase:
             self.reset()
-            return self._go_accept(game, pioneer)
+            cmd, _, _ = self._go_accept(game, pioneer)
+            return cmd, None, ""
 
-        # 任务进行中
-        # 先解析上一回合沙盒命令的结果
-        ans = _extract_answer(game.last_cmd_result)
-        if ans and _plausible(ans, phase) and self.answer is None:
-            self.answer = ans
+        # 新任务开始
+        if phase != self.task_desc:
+            self.task_desc = phase
+            self.history = []
+            self.pending_cmd = None
+            self.answer = None
+            self.mode = self.READ_DOC
 
-        if self.answer is not None and _plausible(self.answer, phase) and not self.submitted:
-            self.submitted = True
-            return {"action": "submitAnswer", "taskAnswer": self.answer}, None
+        # 累积本回合回传的结果
+        if self.mode == self.WAIT_DOC and game.last_cmd_result:
+            self.history.append((self.pending_cmd or "读取文档", game.last_cmd_result))
+            self.pending_cmd = None
+        elif self.mode == self.WAIT_CMD and game.last_cmd_result:
+            self.history.append((self.pending_cmd or "", game.last_cmd_result))
+            self.pending_cmd = None
+        elif self.mode == self.WAIT_LLM:
+            pass  # llmResp 在 _advance 里解析
 
-        # 继续探测
-        cmd = self._next_explore()
-        return None, cmd
+        return self._advance(game, pioneer)
 
-    def _go_accept(self, game: GameState, pioneer: Role) -> tuple[dict | None, str | None]:
+    def _advance(self, game: GameState, pioneer: Role) -> tuple[dict | None, str | None, str]:
+        phase = game.phase_task
+
+        if self.mode == self.READ_DOC:
+            cmd = self._doc_read_cmd(phase)
+            self.pending_cmd = cmd
+            self.mode = self.WAIT_DOC
+            return None, cmd, ""
+
+        if self.mode == self.WAIT_DOC:
+            # 文档内容已回，交给大模型
+            return self._send_prompt()
+
+        if self.mode == self.WAIT_LLM:
+            cmd, ans = _parse_llm(game.llm_resp)
+            if ans is not None and _plausible(ans, phase):
+                self.answer = ans
+                self.mode = self.DONE
+                return {"action": "submitAnswer", "taskAnswer": ans}, None, ""
+            if cmd is not None:
+                self.pending_cmd = cmd
+                self.mode = self.WAIT_CMD
+                return None, cmd, ""
+            # 大模型未给出可执行指令，重新询问
+            return self._send_prompt()
+
+        if self.mode == self.WAIT_CMD:
+            # 命令结果已回（在 step 中已累积），交给大模型
+            return self._send_prompt()
+
+        if self.mode == self.DONE:
+            # 已提交；若被判答案错误且任务仍在，重试
+            if phase == self.task_desc and self._has_answer_error(game):
+                self.history.append(("提交结果", "答案被判错误，请重新推理后再提交"))
+                self.answer = None
+                return self._send_prompt()
+            return None, None, ""
+
+        return None, None, ""
+
+    # ---- 辅助 ----
+    def _send_prompt(self) -> tuple[None, None, str]:
+        self.mode = self.WAIT_LLM
+        return None, None, self._build_prompt()
+
+    def _build_prompt(self) -> str:
+        lines = []
+        for i, (cmd, result) in enumerate(self.history, 1):
+            lines.append(f"[{i}] 命令：{cmd}\n结果：{result}")
+        context = "\n\n".join(lines) if lines else "（暂无）"
+        return _PROMPT_TEMPLATE.format(task=self.task_desc, context=context)
+
+    @staticmethod
+    def _doc_read_cmd(phase: str) -> str:
+        fname = _extract_md_filename(phase)
+        if fname:
+            return f"cat {fname} 2>/dev/null || find . -name '{fname}' -exec cat {{}} \\; 2>/dev/null"
+        return 'pwd; ls -la; for f in *.md *.txt; do echo "== $f =="; cat "$f"; done 2>/dev/null'
+
+    @staticmethod
+    def _has_answer_error(game: GameState) -> bool:
+        return any(e.get("errorCode") == 2 for e in game.errors)
+
+    def _go_accept(self, game: GameState, pioneer: Role) -> tuple[dict | None, None, str]:
         tp = self._nearest_valid_task_point(game, pioneer.pos)
         if tp is None:
-            return None, None
+            return None, None, ""
         if geo.cheb(pioneer.pos, tp) <= 1:
-            return {"action": "acceptTask"}, None
-        mv = self._move_adjacent(game, pioneer, tp)
-        return mv, None
-
-    def _next_explore(self) -> str | None:
-        if self.explore_idx >= len(_EXPLORE_CMDS):
-            return None
-        cmd = _EXPLORE_CMDS[self.explore_idx]
-        self.explore_idx += 1
-        return cmd
+            return {"action": "acceptTask"}, None, ""
+        return self._move_adjacent(game, pioneer, tp), None, ""
 
     @staticmethod
     def _nearest_valid_task_point(game: GameState, pos: Pos) -> Pos | None:
         own = game.own_task_points()
-        valid = [t for t in game.player_tasks if t.is_valid]
-        valid_positions = {t.task_position.key() for t in valid}
+        valid_positions = {t.task_position.key() for t in game.player_tasks if t.is_valid}
         candidates = [z.pos for z in own if z.pos.key() in valid_positions]
         if not candidates:
             return None
