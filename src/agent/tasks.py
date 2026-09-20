@@ -4,7 +4,7 @@
 
 1. 开拓者 ``acceptTask`` 领取任务。
 2. 下一回合 ``req.phaseTask`` 描述任务（通常是"读取 xxx.md 文档"）。
-3. 通过 ``executeCmd`` 在沙盒里读取 xxx.md，结果经下一回合 ``lastCmdResult`` 返回。
+3. 先用 ``executeCmd`` 定位 xxx.md 的真实路径（``find`` 只打印路径、抑制 stderr），再用 ``executeCmd`` ``cat`` 该路径读取内容，结果均经下一回合 ``lastCmdResult`` 返回。
 4. 把任务描述 + 已收集信息通过 ``resp.prompt`` 交给判题器大模型，结果经下一回合 ``llmResp`` 返回。
 5. 根据 ``llmResp`` 决定：执行命令（``executeCmd``）或提交答案（``submitAnswer``）。
 6. 命令结果逐回合累积，循环 prompt → 命令/答案，直到得到最终答案提交。
@@ -65,8 +65,8 @@ def _plausible(answer: str, phase_task: str) -> bool:
 
 
 def _extract_md_filename(phase_task: str) -> str | None:
-    m = re.search(r"([\w\-\./]+\.md)", phase_task)
-    return m.group(1) if m else None
+    m = re.search(r"[A-Za-z_][\w\-\./]+\.md", phase_task)
+    return m.group(0) if m else None
 
 
 def _looks_like_command(text: str) -> bool:
@@ -114,8 +114,9 @@ class TaskEngine:
     """开拓者任务状态机（跨回合持久）。"""
 
     IDLE = "idle"
-    READ_DOC = "read_doc"      # 下一动作：读取 xxx.md
-    WAIT_DOC = "wait_doc"      # 已发 executeCmd 读文档，等 lastCmdResult
+    FIND_FILE = "find_file"    # 下一动作：定位文件路径（find，只打印路径）
+    WAIT_FIND = "wait_find"    # 已发 find，等 lastCmdResult（文件路径）
+    WAIT_DOC = "wait_doc"      # 已发 cat，等 lastCmdResult（文件内容）
     WAIT_LLM = "wait_llm"      # 已发 prompt，等 llmResp
     WAIT_CMD = "wait_cmd"      # 已发 executeCmd，等 lastCmdResult
     DONE = "done"              # 已提交答案
@@ -125,6 +126,7 @@ class TaskEngine:
         self.task_desc = ""
         self.history: list[tuple[str, str]] = []
         self.pending_cmd: str | None = None
+        self.doc_path: str | None = None
         self.answer: str | None = None
 
     def reset(self) -> None:
@@ -132,6 +134,7 @@ class TaskEngine:
         self.task_desc = ""
         self.history = []
         self.pending_cmd = None
+        self.doc_path = None
         self.answer = None
 
     def step(self, game: GameState) -> tuple[dict | None, str | None, str]:
@@ -152,11 +155,15 @@ class TaskEngine:
             self.task_desc = phase
             self.history = []
             self.pending_cmd = None
+            self.doc_path = None
             self.answer = None
-            self.mode = self.READ_DOC
+            self.mode = self.FIND_FILE
 
         # 累积本回合回传的结果
-        if self.mode == self.WAIT_DOC and game.last_cmd_result:
+        if self.mode == self.WAIT_FIND:
+            # find 只回文件路径，内部消费，不进历史
+            self.doc_path = self._parse_path(game.last_cmd_result)
+        elif self.mode == self.WAIT_DOC and game.last_cmd_result:
             self.history.append((self.pending_cmd or "读取文档", game.last_cmd_result))
             self.pending_cmd = None
         elif self.mode == self.WAIT_CMD and game.last_cmd_result:
@@ -170,8 +177,25 @@ class TaskEngine:
     def _advance(self, game: GameState, pioneer: Role) -> tuple[dict | None, str | None, str]:
         phase = game.phase_task
 
-        if self.mode == self.READ_DOC:
-            cmd = self._doc_read_cmd(phase)
+        if self.mode == self.FIND_FILE:
+            fname = _extract_md_filename(phase)
+            if fname is None:
+                # 无明确文件名，直接兜底读取（只输出内容）
+                cmd = self._glob_read_cmd()
+                self.pending_cmd = cmd
+                self.mode = self.WAIT_DOC
+                return None, cmd, ""
+            cmd = self._find_cmd(fname)
+            self.pending_cmd = cmd
+            self.mode = self.WAIT_FIND
+            return None, cmd, ""
+
+        if self.mode == self.WAIT_FIND:
+            # 已定位到路径（在 step 中解析），再读取内容
+            if self.doc_path:
+                cmd = self._read_cmd(self.doc_path)
+            else:
+                cmd = self._glob_read_cmd()
             self.pending_cmd = cmd
             self.mode = self.WAIT_DOC
             return None, cmd, ""
@@ -220,11 +244,34 @@ class TaskEngine:
         return _PROMPT_TEMPLATE.format(task=self.task_desc, context=context)
 
     @staticmethod
-    def _doc_read_cmd(phase: str) -> str:
-        fname = _extract_md_filename(phase)
-        if fname:
-            return f"cat {fname} 2>/dev/null || find . -name '{fname}' -exec cat {{}} \\; 2>/dev/null"
-        return 'pwd; ls -la; for f in *.md *.txt; do echo "== $f =="; cat "$f"; done 2>/dev/null'
+    def _find_cmd(fname: str) -> str:
+        """定位文件路径：只打印路径，stderr 抑制，找到即停，避免中间产物污染结果。"""
+        base = fname.rsplit("/", 1)[-1]
+        return f"find . -name '{base}' -print -quit 2>/dev/null"
+
+    @staticmethod
+    def _read_cmd(path: str) -> str:
+        """读取已定位的文件内容，只输出内容。"""
+        return f"cat '{path}' 2>/dev/null"
+
+    @staticmethod
+    def _glob_read_cmd() -> str:
+        """兜底：无明确文件名时，只输出 CWD 下 md/txt 内容，不带 ls/pwd 等中间产物。"""
+        return 'for f in *.md *.txt; do [ -f "$f" ] && cat "$f"; done 2>/dev/null'
+
+    @staticmethod
+    def _parse_path(result: str) -> str | None:
+        """从 find 输出里提取文件路径，过滤 permission denied 等干扰行。"""
+        if not result:
+            return None
+        for ln in result.splitlines():
+            ln = ln.strip()
+            if not ln or ln.startswith("["):
+                continue
+            if "permission denied" in ln.lower() or ln.startswith("find:"):
+                continue
+            return ln
+        return None
 
     @staticmethod
     def _has_answer_error(game: GameState) -> bool:
