@@ -56,7 +56,7 @@ _TOKEN_RE = re.compile(r"TOKEN\s*[:=]\s*([A-Za-z0-9_\-]{2,})", re.I)
 _JSON_KEY_RE = re.compile(r'\{\s*"([A-Za-z_]\w*)"\s*:')
 _SHELL_HINT_RE = re.compile(
     r"(^|\s)(cd|ls|cat|find|grep|sed|awk|head|tail|echo|chmod|chown|cp|mv|rm|"
-    r"python3?|pip3?|bash|sh|env|export|make|gcc|node|\./)"
+    r"python3?|pip3?|curl|wget|jq|bash|sh|env|export|make|gcc|node|\./)"
 )
 _PLACEHOLDER_RE = re.compile(
     r"\b(x{2,}|unknown|todo|tbd|n/?a|none|null|your[_-]?token|placeholder)\b"
@@ -234,9 +234,30 @@ def _is_selfevo(text: str) -> bool:
     return has_token and has_action
 
 
+def _task_body(session) -> str:
+    """任务主体：已读到的任务描述文件内容优先，退回 phaseTask 原文。
+
+    phaseTask 往往只是"请阅读 xxx.md"，真正的任务要求在文件里。一旦把文件内容
+    读进 doc_text，后面所有给大模型看的、以及任务类型判断，都要用完整正文；
+    否则大模型只能看到一句"请阅读 xxx.md"，只能瞎猜答案。
+    """
+    return session.doc_text or session.text
+
+
 def _sandbox_task(session) -> bool:
     """要在沙盒里跑命令的任务：答案必须真跑出来，不能拿半成品交卷。"""
-    return _is_selfevo(session.text) or bool(_file_names(session.text))
+    body = _task_body(session)
+    return _is_selfevo(body) or bool(_file_names(body))
+
+
+def _selfevo_task(session) -> bool:
+    """真·自进化类：要在沙盒里跑 ./check / 修代码拿 token 的那一类。
+
+    区别于"查询 API 提交统计 JSON"这种同样要跑命令、但没有验收脚本的任务。
+    只有前者才走 ls -> ./check -> 读源码 -> 修复 的确定性 SOP，并从脚本输出里
+    直接抽 token；后者要把控制权交给大模型去 curl/算。
+    """
+    return _is_selfevo(_task_body(session))
 
 
 def _evidence(session) -> bool:
@@ -256,10 +277,15 @@ def _pending(session) -> list[str]:
 
 
 def _at_hunt_stage(session) -> bool:
-    """该让模型抽答案了吗：跑过验收脚本，或已经能解析出候选答案。"""
-    return bool(session.ran_round) or bool(
-        _token_answer(session) or _json_answer(session)
-    )
+    """该让模型抽答案了吗：验收脚本真跑通过（自进化类）。
+
+    只读到了任务描述（read_round）绝不能算"有答案"——像"查询 API 提交统计
+    JSON"这类任务，读完说明才是开始，还得让模型去 curl、去算。之前这里用
+    _token_answer/_json_answer 探测，结果任务描述里的 JSON 示例/模板被当成
+    候选答案，导致刚读完说明就去抽答案，模型对着"请阅读 xxx.md"瞎编。
+    候选答案的提交交给 answer_ready/_resolve_answer 走，不在这里提前触发。
+    """
+    return bool(session.ran_round)
 
 
 def _workspace(session) -> str | None:
@@ -583,7 +609,8 @@ def _absorb_locate(session, body: str, round_no: int) -> None:
 def _next_cmd(turn: Turn, state: GameState) -> str:
     session = state.task
     done = {cmd for cmd, _result in session.transcript}
-    # 1. 任务描述文件：一条命令里定位 + 读出内容（判题器每回合只回一条命令的结果）
+    # 1. 任务描述文件：一条命令里定位 + 读出内容。这是唯一必须先确定性做的一步，
+    #    没读到任务正文之前，任何命令/提问都只是瞎猜。
     if not session.read_round:
         if session.task_file:
             cmd = f"cat {session.task_file}"
@@ -593,49 +620,40 @@ def _next_cmd(turn: Turn, state: GameState) -> str:
             cmd = _locate_cmd(name)
             if cmd not in done:
                 return cmd
-    # 3. 工作区：先补读还没读过的说明文档，再走固定剧本
-    doc = _unread_docs(session)
-    if doc is not None and doc not in done:
-        return doc
-    for cmd in _chore(session):
-        if cmd not in done:
-            return cmd
-    # 3.5 修复循环：check 判失败后，先把源码逐份读进 transcript，再交给 LLM 修复
-    src = _unread_source(session)
-    if src is not None and src not in done:
-        return src
-    # 4. 工作区还没定位到才需要全局乱翻；已经知道工作区就别浪费回合了
-    if _workdir(session) is None:
-        for cmd in _EXPLORE_CMDS:
+    # 2. 真·自进化类才走确定性 SOP（看目录 -> ./check -> 读源码 -> 修复）。
+    #    "查询 API 提交统计 JSON"这种任务没有 ./check，读完正文就该把控制权交给
+    #    大模型去 curl/算，别再盲目 ls/find/check 烧回合。
+    if _selfevo_task(session):
+        doc = _unread_docs(session)
+        if doc is not None and doc not in done:
+            return doc
+        for cmd in _chore(session):
             if cmd not in done:
                 return cmd
-    # 5. 大模型给的命令只当兜底：它看不到沙盒结果时只会瞎猜（比如漏掉 cwd）
+        src = _unread_source(session)
+        if src is not None and src not in done:
+            return src
+        if _workdir(session) is None:
+            for cmd in _EXPLORE_CMDS:
+                if cmd not in done:
+                    return cmd
+    # 3. 大模型排的队：读完了正文，优先跑模型给的命令，而不是上面的固定剧本。
     for cmd in _pending(session):
         return cmd
-    # 6. 验收脚本：换过命令就立刻重跑；否则每 _CHECK_EVERY 回合探一次，
-    #    这样命令用尽后还有兜底通道（沙盒状态可能被外部改变 / LLM 迟到）
-    check = _check_cmd(session)
-    if check is not None:
-        last = session.transcript[-1][0] if session.transcript else ""
-        if (
-            check not in done
-            or last != check
-            or turn.round_no - session.check_round >= _CHECK_EVERY
-        ):
-            session.check_round = turn.round_no
-            return check
-    fallback = _task_driven_cmd(session.text)
-    return fallback if fallback not in done else ""
-
-
-def _task_driven_cmd(text: str) -> str:
-    paths = re.findall(r"(/[\w./-]+)", text)
-    for path in paths:
-        if "." in path.rsplit("/", 1)[-1]:
-            return f"cat {path}"
-    if paths:
-        return f"ls -la {paths[0]}"
-    return "ls -la && find . -maxdepth 2 -type f | head -20"
+    # 4. 自进化类验收脚本兜底：换过命令立刻重跑，否则每 _CHECK_EVERY 回合探一次。
+    if _selfevo_task(session):
+        check = _check_cmd(session)
+        if check is not None:
+            last = session.transcript[-1][0] if session.transcript else ""
+            if (
+                check not in done
+                or last != check
+                or turn.round_no - session.check_round >= _CHECK_EVERY
+            ):
+                session.check_round = turn.round_no
+                return check
+    # 5. 没有确定性命令可跑时，把回合留给 prompt 通道问大模型，别硬塞盲命令。
+    return ""
 
 
 # --------------------------------------------------------------- LLM 通道
@@ -748,8 +766,19 @@ def _as_commands(text: str) -> list[str] | None:
     return cmds[:8]
 
 
+def _strip_fences(text: str) -> str:
+    """剥掉 ```json ... ``` 这类 markdown 围栏，模型很爱包一层。"""
+    body = text.strip()
+    if not body.startswith("```"):
+        return body
+    body = re.sub(r"^```[a-zA-Z]*\s*", "", body)
+    body = re.sub(r"\s*```$", "", body)
+    return body.strip()
+
+
 def _apply_answer(state: GameState, text: str) -> bool:
     session = state.task
+    text = _strip_fences(text)
     if len(text) > 4000:
         return False
     head = text[:80].lower()
@@ -790,12 +819,14 @@ def llm_plan_prompt(state: GameState) -> str:
     return (
         "你在一个无网络的 Linux 沙盒里用 shell 命令完成下面的比赛任务。\n"
         f"{where}"
-        "命令必须真能在沙盒里跑通；需要看文件就 cat，需要改文件就 sed -i 或重定向。\n"
+        "命令必须真能在沙盒里跑通；需要看文件就 cat，需要改文件就 sed -i 或重定向，"
+        "需要访问本地 HTTP 服务就用 curl，需要统计/计算就用 python3 -c 或管道。\n"
         f"{fix_hint}"
-        f"任务描述：\n{session.text[:1200]}\n"
+        f"任务描述：\n{_task_body(session)[:2500]}\n"
         f"已执行的命令与输出：\n{transcript or '(尚未执行任何命令)'}\n"
-        "请给出下一步要执行的 shell 命令，用于查看文件、修复代码、运行验收脚本，"
-        "只输出 JSON 数组，不要解释：[\"cmd1\",\"cmd2\",...]"
+        "如果你已经从上面的输出里拿到足够信息、能算出最终答案，就直接输出答案本体"
+        "（JSON，不要命令、不要解释）；否则只输出下一步 shell 命令的 JSON 数组："
+        "[\"cmd1\",\"cmd2\",...]"
     )
 
 
@@ -832,7 +863,7 @@ def llm_extract_prompt(state: GameState) -> str:
         ) + "\n"
     return (
         "你需要提交一个比赛任务的最终答案。\n"
-        f"任务描述：\n{session.text[:1200]}\n"
+        f"任务描述：\n{_task_body(session)[:2500]}\n"
         "沙盒执行记录（这是唯一可信的信息来源）：\n"
         f"{transcript}\n"
         f"{rejected}"
@@ -851,12 +882,16 @@ def _json_ok(text: str) -> bool:
 
 
 def _resolve_answer(session) -> str:
-    answer = _token_answer(session)
-    if answer:
-        return answer
-    answer = _json_answer(session)
-    if answer:
-        return answer
+    # 只有自进化类（./check 会把 token 直接打在输出里）才从 transcript 里抽答案。
+    # "查询 API 提交统计 JSON"这类任务里，curl 出来的是输入数据，答案要由大模型
+    # 算了之后给（draft_answer），绝不能把原始 API 响应当答案交。
+    if _selfevo_task(session):
+        answer = _token_answer(session)
+        if answer:
+            return answer
+        answer = _json_answer(session)
+        if answer:
+            return answer
     if session.json_required or _sandbox_task(session):
         return ""  # 沙盒任务必须真跑出结果，不能拿半成品交卷
     return _text_answer(session)
