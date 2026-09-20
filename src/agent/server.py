@@ -31,6 +31,7 @@ class _Handler(BaseHTTPRequestHandler):
             logsetup.trace("error", {"error": str(exc)})
             response = {"roleCommandMap": {}, "prompt": "", "executeCmd": ""}
 
+        logsetup.emit_response(response)
         logsetup.trace("response", {"payload": payload, "response": response})
         self._reply(200, response)
 

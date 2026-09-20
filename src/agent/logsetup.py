@@ -28,8 +28,13 @@ def setup() -> None:
 
 
 def emit(payload: dict) -> None:
-    """把判题器下发的原始 payload 打印到 stdout（唯一 stdout 日志行）。"""
+    """把判题器下发的原始 payload 打印到 stdout。"""
     logging.info("[agent] %s", json.dumps(payload, ensure_ascii=False))
+
+
+def emit_response(response: dict) -> None:
+    """把本回合返回给判题器的响应打印到 stdout。"""
+    logging.info("[agent-resp] %s", json.dumps(response, ensure_ascii=False))
 
 
 def trace(kind: str, data: dict) -> None:
