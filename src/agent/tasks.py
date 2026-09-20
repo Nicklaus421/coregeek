@@ -245,9 +245,13 @@ class TaskEngine:
 
     @staticmethod
     def _find_cmd(fname: str) -> str:
-        """定位文件路径：只打印路径，stderr 抑制，找到即停，避免中间产物污染结果。"""
+        """定位文件路径：只打印路径、抑制 stderr、找到即停。
+
+        ``-xdev`` 不跨文件系统（避免陷进 /proc、/sys 等），``-maxdepth 4`` 限制深度，
+        防止无界遍历海量目录树导致沙盒 15 秒超时。
+        """
         base = fname.rsplit("/", 1)[-1]
-        return f"find . -name '{base}' -print -quit 2>/dev/null"
+        return f"find . -xdev -maxdepth 4 -name '{base}' -print -quit 2>/dev/null"
 
     @staticmethod
     def _read_cmd(path: str) -> str:
