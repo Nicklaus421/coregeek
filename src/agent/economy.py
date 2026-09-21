@@ -49,21 +49,32 @@ class BuildPlan:
     """围绕基地的固定建造蓝图：距离 1 圈放塔，距离 2 圈放围墙。
 
     围墙从来袭方向（attack_corner）优先建，背敌一侧留出入口供角色进出。
+    三塔聚成一簇，围绕一个「枢纽格」摆放，让一个工人站在枢纽格即可同时操控三塔。
     """
 
     def __init__(self, base_cells: list[Pos], w: int, h: int):
         self.base_cells = base_cells
+        self.w = w
+        self.h = h
         self.attack = attack_corner(base_cells, w, h)
         self.ring1 = geo.ring_cells(base_cells, 1, w, h)
         self.ring2 = geo.ring_cells(base_cells, 2, w, h)
+        self.hub = Pos(0, 0)
         self.tower_sites = self._pick_towers()
         self.wall_order = self._wall_order()
 
     def _pick_towers(self) -> list[Pos]:
-        # 塔靠近来袭面摆放（火箭射程全图，摆位用于阻挡机器人）
-        ring = list(self.ring1)
-        ring.sort(key=lambda p: geo.cheb(p, self.attack))
-        return ring[: len(TOWER_LOADOUT)]
+        # station 为基地左上角（最小 x、最大 y）；据此把三塔聚成一簇。
+        st_x = min(p.x for p in self.base_cells)
+        st_y = max(p.y for p in self.base_cells)
+        cx = sum(p.x for p in self.base_cells) / len(self.base_cells)
+        if cx < self.w / 2:
+            # 基地靠左（左上角）：塔建在基地左下角，枢纽格 (st_x-1, st_y-1)
+            self.hub = Pos(st_x - 1, st_y - 1)
+            return [Pos(st_x, st_y - 2), Pos(st_x - 1, st_y - 2), Pos(st_x - 1, st_y)]
+        # 基地靠右（右下角）：塔建在基地右下角，枢纽格 (st_x+2, st_y-1)
+        self.hub = Pos(st_x + 2, st_y - 1)
+        return [Pos(st_x + 2, st_y), Pos(st_x + 1, st_y - 2), Pos(st_x + 2, st_y - 2)]
 
     def _wall_order(self) -> list[Pos]:
         ring = list(self.ring2)
