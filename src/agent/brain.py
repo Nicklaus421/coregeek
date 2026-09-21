@@ -27,6 +27,9 @@ from .tasks import TaskEngine
 
 MAX_HP = {"worker": 220, "pioneer": 200}
 
+# 建围墙前单次采石目标：攒够这一批再回基地建墙，避免一石一返的低效往返。
+STONE_BATCH = 10
+
 
 class Agent:
     def __init__(self) -> None:
@@ -35,6 +38,8 @@ class Agent:
         self.task_engine = TaskEngine()
         # worker_id -> (ore, mine_pos_key)：持久化采矿目标，避免远距离路径摇摆
         self._mine_targets: dict[int, tuple[str, tuple[int, int]]] = {}
+        # worker_id -> 本批采石目标数：攒够一批再回建墙，建完清零后重新采
+        self._stone_goal: dict[int, int] = {}
 
     # ---- 入口 ----
     def decide(self, payload: dict) -> dict:
@@ -78,14 +83,11 @@ class Agent:
     def _day_plan(self, game: GameState) -> dict:
         cmds: dict[int, dict] = {}
         claimed: set[tuple[int, int]] = set()
-        retreat = game.rounds_until_night <= 12
-        # 撤离时按稳定分配去各自的塔，避免多人挤同一塔
-        tower_for: dict[int, Role] = {}
-        if retreat:
-            for w, tower in self._assign_workers_to_towers(game):
-                tower_for[w.id] = tower
+        # 稳定分配工人到塔，白天撤离与夜晚操控共用，避免多人挤同一塔
+        tower_for: dict[int, Role] = {w.id: t for w, t in self._assign_workers_to_towers(game)}
         for w in game.workers:
-            cmd = self._day_worker(game, w, claimed, retreat, tower_for.get(w.id))
+            tower = tower_for.get(w.id)
+            cmd = self._day_worker(game, w, claimed, self._should_retreat(game, w, tower), tower)
             if cmd is not None:
                 cmds[w.id] = cmd
         return cmds
@@ -113,12 +115,20 @@ class Agent:
                 return {"action": "build", "name": ROCKET, "targetPos": [site.to_dict()]}
             return self._move_adjacent(game, w, site)
 
-        # 2. 建围墙（需采石头，从来袭方向开始）
+        # 2. 建围墙（批量采石后回建，从来袭方向开始）
         wall = self._unbuilt_wall(game, claimed)
         if wall is not None:
-            if not self._has_item(w, "stone"):
+            stones = self._item_count(w, "stone")
+            if stones == 0:
+                # 没石头 -> 定下本批采石目标，出门采满一批再回
+                self._stone_goal[w.id] = min(STONE_BATCH, self._remaining_walls(game))
                 return self._go_collect(game, w, "stone")
-            # 有石头才占坑，避免无石工人空占位置
+            goal = self._stone_goal.get(w.id, 0)
+            if goal > 0 and stones < goal:
+                # 还没攒够一批，继续采
+                return self._go_collect(game, w, "stone")
+            # 攒够一批或已进入建墙阶段：把背包石头逐一建成墙，直到采完再返
+            self._stone_goal[w.id] = 0
             claimed.add(wall.key())
             if geo.cheb(w.pos, wall) == 1:
                 return {"action": "build", "name": "wall", "targetPos": [wall.to_dict()]}
@@ -227,6 +237,19 @@ class Agent:
             if cell.key() not in built and cell.key() not in claimed:
                 return cell
         return None
+
+    def _remaining_walls(self, game: GameState) -> int:
+        if self._plan is None:
+            return 0
+        built = {w.pos.key() for w in game.walls}
+        return sum(1 for c in self._plan.wall_order if c.key() not in built)
+
+    @staticmethod
+    def _should_retreat(game: GameState, w: Role, tower: Role | None) -> bool:
+        """按到塔距离动态决定是否回撤：留出足够回合，其余时间尽量在外采矿。"""
+        if tower is None:
+            return False
+        return game.rounds_until_night <= geo.cheb(w.pos, tower.pos) + 2
 
     def _go_collect(self, game: GameState, w: Role, ore: str) -> dict | None:
         mine = self._select_mine(game, w, ore)
