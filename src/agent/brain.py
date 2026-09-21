@@ -107,8 +107,9 @@ class Agent:
         # 1. 建满 3 座塔
         site = self._unbuilt_tower_site(game, claimed)
         if site is not None:
-            if geo.cheb(w.pos, site) <= 1:
-                claimed.add(site.key())
+            # 先占坑再移动，避免两个工人同时抢同一个塔位
+            claimed.add(site.key())
+            if geo.cheb(w.pos, site) == 1:
                 return {"action": "build", "name": ROCKET, "targetPos": [site.to_dict()]}
             return self._move_adjacent(game, w, site)
 
@@ -116,9 +117,10 @@ class Agent:
         wall = self._unbuilt_wall(game, claimed)
         if wall is not None:
             if not self._has_item(w, "stone"):
-                return self._go_collect(game, w, "stone", claimed)
-            if geo.cheb(w.pos, wall) <= 1:
-                claimed.add(wall.key())
+                return self._go_collect(game, w, "stone")
+            # 有石头才占坑，避免无石工人空占位置
+            claimed.add(wall.key())
+            if geo.cheb(w.pos, wall) == 1:
                 return {"action": "build", "name": "wall", "targetPos": [wall.to_dict()]}
             return self._move_adjacent(game, w, wall)
 
@@ -170,9 +172,11 @@ class Agent:
 
     # ---- 通用 ----
     def _move_adjacent(self, game: GameState, role: Role, target: Pos) -> dict | None:
-        if geo.cheb(role.pos, target) <= 1:
-            return None
         blocked = game.blocked_set(exclude_role_id=role.id)
+        # 目标格也视为障碍（避免走到要建/要采的格子上）；角色已站在目标格时除外，
+        # 此时要把它挪到旁边一格去。
+        if role.pos.key() != target.key():
+            blocked.add(target.key())
         best: list[Pos] | None = None
         for n in geo.neighbors(target, game.width, game.height):
             if n.key() in blocked:
@@ -224,11 +228,10 @@ class Agent:
                 return cell
         return None
 
-    def _go_collect(self, game: GameState, w: Role, ore: str, claimed: set) -> dict | None:
-        mine = self._select_mine(game, w, ore, claimed)
+    def _go_collect(self, game: GameState, w: Role, ore: str) -> dict | None:
+        mine = self._select_mine(game, w, ore)
         if mine is None:
             return None
-        claimed.add(mine.pos.key())
         if geo.cheb(w.pos, mine.pos) <= 1:
             return {"action": "collect", "targetPos": [mine.pos.to_dict()]}
         return self._move_adjacent(game, w, mine.pos)
@@ -239,20 +242,23 @@ class Agent:
                 return z
         return None
 
-    def _select_mine(self, game: GameState, w: Role, ore: str, claimed: set) -> Zone | None:
-        """选矿：远距离时锁定同一矿（持久目标）避免来回摇摆；到矿旁后自然就近采。"""
+    def _select_mine(self, game: GameState, w: Role, ore: str) -> Zone | None:
+        """选矿：远距离时锁定同一矿（持久目标）避免来回摇摆；到矿旁后自然就近采。
+
+        矿有多个资源格，允许多个工人采同一矿，故不按矿整体占坑，避免矿少时工人无矿可采而呆立。
+        """
         t = self._mine_targets.get(w.id)
         if t is not None and t[0] == ore:
             mine = self._mine_at(game, ore, t[1])
-            if mine is not None and t[1] not in claimed and geo.cheb(w.pos, mine.pos) > 1:
+            if mine is not None and geo.cheb(w.pos, mine.pos) > 1:
                 return mine
-        mine = self._nearest_mine(game, w, ore, claimed)
+        mine = self._nearest_mine(game, w, ore)
         if mine is not None:
             self._mine_targets[w.id] = (ore, mine.pos.key())
         return mine
 
-    def _nearest_mine(self, game: GameState, w: Role, ore: str, claimed: set) -> Zone | None:
-        mines = [z for z in game.mines if z.neutral_type == ore and z.pos.key() not in claimed]
+    def _nearest_mine(self, game: GameState, w: Role, ore: str) -> Zone | None:
+        mines = [z for z in game.mines if z.neutral_type == ore]
         if not mines:
             return None
         return min(mines, key=lambda z: geo.cheb(w.pos, z.pos))
@@ -267,8 +273,8 @@ class Agent:
                 return {"action": "sell", "name": ore, "num": self._item_count(w, ore)}
             return self._move_adjacent(game, w, vendor.pos)
         for ore in ("stone", "copper", "iron"):
-            if self._nearest_mine(game, w, ore, claimed) is not None:
-                return self._go_collect(game, w, ore, claimed)
+            if self._nearest_mine(game, w, ore) is not None:
+                return self._go_collect(game, w, ore)
         return None
 
     def _ore_to_sell(self, game: GameState, w: Role) -> str | None:
