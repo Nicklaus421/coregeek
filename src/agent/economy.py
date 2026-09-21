@@ -83,15 +83,22 @@ class BuildPlan:
         # 背敌一侧（离来袭角最远的 ring2 格）留作出入口
         entrance = max(ring, key=lambda p: geo.cheb(p, self.attack))
         order = [p for p in ring if p.key() != entrance.key()]
+        # 枢纽格旁留通道：操作手白天要出去采集、夜晚要回枢纽操控，不能被墙圈死
+        order = [p for p in order if geo.cheb(p, self.hub) > 1]
         # 从近敌一侧开始围，先把受攻击面封住
         order.sort(key=lambda p: geo.cheb(p, self.attack))
         return order
 
 
-def choose_rocket_target(robots: list[Robot]) -> Pos | None:
-    """为火箭选择落点：优先覆盖高价值机器人集群（中心 20 + 周围 8 格溅射 10）。"""
-    if not robots:
-        return None
+def choose_rocket_targets(robots: list[Robot], n: int) -> list[Pos]:
+    """为火箭塔选 n 个落点（n = 塔等级，决定每轮发射的导弹数）。
+
+    贪心逐枚分配：每枚优先覆盖尚未被命中机器人的高价值集群（中心 20 权重 x2、
+    溅射 10 权重 x1）；当所有机器人至少被覆盖一次后，剩余导弹叠在价值最高的集群上
+    （落点重叠伤害可叠加）。
+    """
+    if not robots or n <= 0:
+        return []
 
     # 候选落点 = 各机器人位置及其 8 邻域（去重）
     candidates: set[tuple[int, int]] = set()
@@ -101,20 +108,35 @@ def choose_rocket_target(robots: list[Robot]) -> Pos | None:
             for dy in (-1, 0, 1):
                 candidates.add((r.pos.x + dx, r.pos.y + dy))
 
-    best_pos: tuple[int, int] | None = None
-    best_val = -1
-    for c in candidates:
-        val = 0
-        for r in robots:
-            d = geo.cheb_xy(c[0], c[1], r.pos.x, r.pos.y)
-            if d == 0:
-                val += ROBOT_VALUE.get(r.role_type, 1) * 2  # 中心 20 点，权重更高
-            elif d <= 1:
-                val += ROBOT_VALUE.get(r.role_type, 1)  # 溅射 10 点
-        if val > best_val:
-            best_val = val
-            best_pos = c
-
-    if best_pos is None:
-        return None
-    return Pos(best_pos[0], best_pos[1])
+    targets: list[Pos] = []
+    hit: set[int] = set()  # 已被前序导弹覆盖的机器人下标
+    for _ in range(n):
+        best: tuple[int, int] | None = None
+        best_marginal = -1
+        best_raw = -1
+        for c in candidates:
+            marginal = 0  # 尚未被命中机器人的价值
+            raw = 0       # 全部机器人价值（用于全部命中后叠加）
+            for i, r in enumerate(robots):
+                d = geo.cheb_xy(c[0], c[1], r.pos.x, r.pos.y)
+                w = ROBOT_VALUE.get(r.role_type, 1)
+                if d == 0:
+                    raw += w * 2
+                    if i not in hit:
+                        marginal += w * 2
+                elif d <= 1:
+                    raw += w
+                    if i not in hit:
+                        marginal += w
+            # 优先覆盖未命中机器人；全部命中后按原始价值叠加到高价值集群
+            if marginal > best_marginal or (marginal == best_marginal and raw > best_raw):
+                best_marginal = marginal
+                best_raw = raw
+                best = c
+        if best is None:
+            break
+        targets.append(Pos(best[0], best[1]))
+        for i, r in enumerate(robots):
+            if geo.cheb_xy(best[0], best[1], r.pos.x, r.pos.y) <= 1:
+                hit.add(i)
+    return targets

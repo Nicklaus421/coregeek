@@ -19,7 +19,7 @@ from .economy import (
     WEAPON_UPGRADE_1,
     WEAPON_UPGRADE_2,
     BuildPlan,
-    choose_rocket_target,
+    choose_rocket_targets,
 )
 from .models import Pos, Role, Zone
 from .state import GameState
@@ -29,6 +29,9 @@ MAX_HP = {"worker": 220, "pioneer": 200}
 
 # 建围墙前单次采石目标：攒够这一批再回基地建墙，避免一石一返的低效往返。
 STONE_BATCH = 10
+
+# 机器人攻击距离：夜晚角色要远离机器人的安全圈半径
+ROBOT_DANGER_RANGE = 3
 
 
 class Agent:
@@ -42,12 +45,15 @@ class Agent:
         self._stone_goal: dict[int, int] = {}
         # 本回合已规划的移动目的地：避免两个角色同回合抢占同一格导致互相卡死
         self._reserved: set[tuple[int, int]] = set()
+        # 上一回合存活角色 id：用于检测复活/新角色，复活后清空遗留状态
+        self._alive_ids: set[int] = set()
 
     # ---- 入口 ----
     def decide(self, payload: dict) -> dict:
         game = GameState(payload)
         self._ensure_plan(game)
         self._reserved = set()
+        self._reset_respawned(game)
 
         if game.is_night:
             cmds = self._night_plan(game)
@@ -61,8 +67,13 @@ class Agent:
             task_cmd, execute_cmd, prompt = self.task_engine.step(game)
 
         role_command_map: dict[str, dict] = {str(k): v for k, v in cmds.items()}
-        if task_cmd is not None and game.pioneer is not None:
-            role_command_map[str(game.pioneer.id)] = task_cmd
+        if game.pioneer is not None:
+            # 夜晚优先保命：机器人逼近时逃离，任务让路
+            pioneer_cmd = self._flee_robots(game, game.pioneer) if game.is_night else None
+            if pioneer_cmd is None and task_cmd is not None:
+                pioneer_cmd = task_cmd
+            if pioneer_cmd is not None:
+                role_command_map[str(game.pioneer.id)] = pioneer_cmd
 
         return {
             "roleCommandMap": role_command_map,
@@ -81,6 +92,22 @@ class Agent:
         if self._plan_key != key:
             self._plan = BuildPlan(base, game.width, game.height)
             self._plan_key = key
+
+    def _reset_respawned(self, game: GameState) -> None:
+        """复活/新角色清空遗留状态，避免复活后在原地呆立。
+
+        角色阵亡会从 ``roles`` 消失，复活后以相同 id 重新出现；此时遗留的
+        ``_mine_targets`` / ``_stone_goal`` 可能指向已耗尽或过远的矿，开拓者的
+        任务状态机也可能停在等待回包的死态，须一并重置让其立刻重新分配任务。
+        """
+        current = {r.id for r in game.roles}
+        for rid in current - self._alive_ids:
+            self._mine_targets.pop(rid, None)
+            self._stone_goal.pop(rid, None)
+        pioneer = game.pioneer
+        if pioneer is not None and pioneer.id not in self._alive_ids:
+            self.task_engine.reset()
+        self._alive_ids = current
 
     # ---- 白天 ----
     def _day_plan(self, game: GameState) -> dict:
@@ -103,6 +130,11 @@ class Agent:
         heal = self._heal(game, w)
         if heal is not None:
             return heal
+
+        # 被围墙围死 -> 拆除背敌一侧围墙逃生，否则后续采集/建墙都走不出去
+        escape = self._escape_wall(game, w)
+        if escape is not None:
+            return escape
 
         # 临近夜晚 -> 操作手撤回枢纽位待命
         if retreat:
@@ -173,20 +205,20 @@ class Agent:
                 target_pool = threats if threats else game.robots
                 for tower in towers:
                     if tower.cooldown <= 0 and geo.cheb(operator.pos, tower.pos) <= 1:
-                        target = choose_rocket_target(target_pool)
-                        if target is not None:
+                        targets = choose_rocket_targets(target_pool, tower.level)
+                        if targets:
                             cmds[tower.id] = {
                                 "action": "attack",
                                 "controllerId": str(operator.id),
-                                "targetPos": [target.to_dict()],
+                                "targetPos": [t.to_dict() for t in targets],
                             }
                         break
 
-        # 其余工人继续采集物资
+        # 其余工人继续采集物资（避开机器人）
         for w in game.workers:
             if operator is not None and w.id == operator.id:
                 continue
-            cmd = self._collect_sell(game, w, set())
+            cmd = self._night_collect(game, w)
             if cmd is not None:
                 cmds[w.id] = cmd
         return cmds
@@ -200,6 +232,9 @@ class Agent:
             blocked.add(target.key())
         # 其他角色本回合已规划的移动目的地也视为障碍，避免同回合抢占同一格互相卡死
         blocked.update(self._reserved)
+        # 夜晚避开机器人的攻击圈，路径不再穿进危险区
+        if game.is_night:
+            blocked.update(self._robot_danger(game))
         best: list[Pos] | None = None
         for n in geo.neighbors(target, game.width, game.height):
             if n.key() in blocked:
@@ -229,6 +264,87 @@ class Agent:
             return None
         return min(game.workers, key=lambda w: (geo.cheb(w.pos, hub), len(w.backpack)))
 
+    # ---- 机器人避让 ----
+    @staticmethod
+    def _threats(game: GameState) -> list:
+        """攻击我方的机器人。"""
+        return [r for r in game.robots if r.target_team == game.team_type]
+
+    def _robot_danger(self, game: GameState) -> set[tuple[int, int]]:
+        """攻击我方的机器人周围 3 格内的危险区。"""
+        danger: set[tuple[int, int]] = set()
+        for r in self._threats(game):
+            x, y = r.pos.x, r.pos.y
+            for dx in range(-ROBOT_DANGER_RANGE, ROBOT_DANGER_RANGE + 1):
+                for dy in range(-ROBOT_DANGER_RANGE, ROBOT_DANGER_RANGE + 1):
+                    if max(abs(dx), abs(dy)) > ROBOT_DANGER_RANGE:
+                        continue
+                    nx, ny = x + dx, y + dy
+                    if 0 <= nx < game.width and 0 <= ny < game.height:
+                        danger.add((nx, ny))
+        return danger
+
+    def _flee_robots(self, game: GameState, role: Role) -> dict | None:
+        """若角色已进入机器人攻击圈，向离机器人更远的相邻格逃命。"""
+        threats = self._threats(game)
+        if not threats:
+            return None
+
+        def min_dist(key: tuple[int, int]) -> int:
+            return min(geo.cheb_xy(key[0], key[1], r.pos.x, r.pos.y) for r in threats)
+
+        cur = min_dist(role.pos.key())
+        if cur > ROBOT_DANGER_RANGE:
+            return None
+        blocked = game.blocked_set(exclude_role_id=role.id)
+        blocked.update(self._reserved)
+        best: Pos | None = None
+        best_d = cur
+        for n in geo.neighbors(role.pos, game.width, game.height):
+            if n.key() in blocked:
+                continue
+            nd = min_dist(n.key())
+            if nd > best_d:
+                best_d = nd
+                best = n
+        if best is not None:
+            self._reserved.add(best.key())
+            return {"action": "move", "targetPos": [best.to_dict()]}
+        return None
+
+    def _night_collect(self, game: GameState, w: Role) -> dict | None:
+        """夜晚的采集/贩卖，全程避开机器人危险区。"""
+        danger = self._robot_danger(game)
+        # 已在危险区 -> 先逃命
+        if w.pos.key() in danger:
+            return self._flee_robots(game, w)
+        # 有矿可卖 -> 去小贩（小贩危险则暂不前往）
+        ore = self._ore_to_sell(game, w)
+        if ore is not None:
+            vendor = game.vendor
+            if vendor is None:
+                return None
+            if geo.cheb(w.pos, vendor.pos) <= 1:
+                return {"action": "sell", "name": ore, "num": self._item_count(w, ore)}
+            if vendor.pos.key() in danger:
+                return None
+            return self._move_adjacent(game, w, vendor.pos)
+        # 采安全矿
+        for ore in ("copper", "iron", "stone"):
+            mine = self._nearest_safe_mine(game, w, ore, danger)
+            if mine is not None:
+                if geo.cheb(w.pos, mine.pos) <= 1:
+                    return {"action": "collect", "targetPos": [mine.pos.to_dict()]}
+                return self._move_adjacent(game, w, mine.pos)
+        return None
+
+    @staticmethod
+    def _nearest_safe_mine(game: GameState, w: Role, ore: str, danger: set) -> Zone | None:
+        mines = [z for z in game.mines if z.neutral_type == ore and z.pos.key() not in danger]
+        if not mines:
+            return None
+        return min(mines, key=lambda z: geo.cheb(w.pos, z.pos))
+
     def _heal(self, game: GameState, role: Role) -> dict | None:
         item = self._find_item(role, MEDICINE)
         if item is None:
@@ -237,6 +353,37 @@ class Agent:
         if role.health < max_hp * 0.5:
             return {"action": "use", "name": item}
         return None
+
+    def _escape_wall(self, game: GameState, role: Role) -> dict | None:
+        """工人被围墙围死（无法到达任何矿/小贩）时，拆除背敌一侧围墙逃生。
+
+        只在白天触发：夜晚拆墙会放机器人进来。拆除指令为 ``remove``，要求工人
+        站在围墙一格内，故先靠近再拆。选离来袭角最远的一堵墙，即在机器人进攻的
+        反方向开口。
+        """
+        if role.role_type != "worker":
+            return None
+        walls = game.walls
+        if not walls:
+            return None
+        targets = [z.pos for z in game.mines]
+        if game.vendor is not None:
+            targets.append(game.vendor.pos)
+        if not targets:
+            return None
+        blocked = game.blocked_set(exclude_role_id=role.id)
+        for t in targets:
+            if geo.bfs_path(role.pos, t, blocked, game.width, game.height) is not None:
+                return None
+        # 被围死：优先拆离来袭角最远（背敌一侧）且紧邻自身的墙，可直接拆除
+        attack = self._plan.attack if self._plan else Pos(0, 0)
+        adjacent = [w for w in walls if geo.cheb(role.pos, w.pos) <= 1]
+        if adjacent:
+            wall = max(adjacent, key=lambda w: geo.cheb(w.pos, attack))
+            return {"action": "remove", "targetPos": [wall.pos.to_dict()]}
+        # 无紧邻墙：先向背敌一侧最远的墙靠拢
+        wall = max(walls, key=lambda w: geo.cheb(w.pos, attack))
+        return self._move_adjacent(game, role, wall.pos)
 
     def _unbuilt_tower_site(self, game: GameState, claimed: set) -> Pos | None:
         if self._plan is None:
