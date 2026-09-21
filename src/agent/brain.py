@@ -40,11 +40,14 @@ class Agent:
         self._mine_targets: dict[int, tuple[str, tuple[int, int]]] = {}
         # worker_id -> 本批采石目标数：攒够一批再回建墙，建完清零后重新采
         self._stone_goal: dict[int, int] = {}
+        # 本回合已规划的移动目的地：避免两个角色同回合抢占同一格导致互相卡死
+        self._reserved: set[tuple[int, int]] = set()
 
     # ---- 入口 ----
     def decide(self, payload: dict) -> dict:
         game = GameState(payload)
         self._ensure_plan(game)
+        self._reserved = set()
 
         if game.is_night:
             cmds = self._night_plan(game)
@@ -187,6 +190,8 @@ class Agent:
         # 此时要把它挪到旁边一格去。
         if role.pos.key() != target.key():
             blocked.add(target.key())
+        # 其他角色本回合已规划的移动目的地也视为障碍，避免同回合抢占同一格互相卡死
+        blocked.update(self._reserved)
         best: list[Pos] | None = None
         for n in geo.neighbors(target, game.width, game.height):
             if n.key() in blocked:
@@ -195,6 +200,7 @@ class Agent:
             if path and (best is None or len(path) < len(best)):
                 best = path
         if best:
+            self._reserved.add(best[0].key())
             return {"action": "move", "targetPos": [best[0].to_dict()]}
         return None
 
