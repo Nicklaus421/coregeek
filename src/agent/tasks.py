@@ -4,7 +4,7 @@
 
 1. 开拓者 ``acceptTask`` 领取任务。
 2. 下一回合 ``req.phaseTask`` 描述任务（通常是"读取 xxx.md 文档"）。
-3. 先用 ``executeCmd`` 定位 xxx.md 的真实路径（``find`` 只打印路径、抑制 stderr），再用 ``executeCmd`` ``cat`` 该路径读取内容，结果均经下一回合 ``lastCmdResult`` 返回。
+3. 用一条 ``executeCmd``（``find -H`` 多路径定位 + 兜底全盘 ``find`` + ``cat``）直接读出文档内容，结果经下一回合 ``lastCmdResult`` 返回；此步不与大模型交互。
 4. 把任务描述 + 已收集信息通过 ``resp.prompt`` 交给判题器大模型，结果经下一回合 ``llmResp`` 返回。
 5. 根据 ``llmResp`` 决定：执行命令（``executeCmd``）或提交答案（``submitAnswer``）。
 6. 命令结果逐回合累积，循环 prompt → 命令/答案，直到得到最终答案提交。
@@ -19,7 +19,7 @@ from . import geometry as geo
 from .models import Pos, Role
 from .state import GameState
 
-_PROMPT_TEMPLATE = """你是《未来战争》游戏里的一个 Agent，需要通过沙盒环境完成一个任务。
+_PROMPT_TEMPLATE = """你是编码大赛里的一个 Agent，需要通过沙盒环境完成一个任务。
 
 请根据下面的【任务】与【已收集信息】决定下一步操作，并严格按以下格式回复（二选一，不要输出其他任何内容）：
 
@@ -114,9 +114,8 @@ class TaskEngine:
     """开拓者任务状态机（跨回合持久）。"""
 
     IDLE = "idle"
-    FIND_FILE = "find_file"    # 下一动作：定位文件路径（find，只打印路径）
-    WAIT_FIND = "wait_find"    # 已发 find，等 lastCmdResult（文件路径）
-    WAIT_DOC = "wait_doc"      # 已发 cat，等 lastCmdResult（文件内容）
+    READ_DOC = "read_doc"      # 下一动作：一条 find+cat 命令直接读出文档内容
+    WAIT_DOC = "wait_doc"      # 已发读文档命令，等 lastCmdResult（文件内容）
     WAIT_LLM = "wait_llm"      # 已发 prompt，等 llmResp
     WAIT_CMD = "wait_cmd"      # 已发 executeCmd，等 lastCmdResult
     DONE = "done"              # 已提交答案
@@ -126,7 +125,6 @@ class TaskEngine:
         self.task_desc = ""
         self.history: list[tuple[str, str]] = []
         self.pending_cmd: str | None = None
-        self.doc_path: str | None = None
         self.answer: str | None = None
 
     def reset(self) -> None:
@@ -134,7 +132,6 @@ class TaskEngine:
         self.task_desc = ""
         self.history = []
         self.pending_cmd = None
-        self.doc_path = None
         self.answer = None
 
     def step(self, game: GameState) -> tuple[dict | None, str | None, str]:
@@ -155,15 +152,11 @@ class TaskEngine:
             self.task_desc = phase
             self.history = []
             self.pending_cmd = None
-            self.doc_path = None
             self.answer = None
-            self.mode = self.FIND_FILE
+            self.mode = self.READ_DOC
 
         # 累积本回合回传的结果
-        if self.mode == self.WAIT_FIND:
-            # find 只回文件路径，内部消费，不进历史
-            self.doc_path = self._parse_path(game.last_cmd_result)
-        elif self.mode == self.WAIT_DOC and game.last_cmd_result:
+        if self.mode == self.WAIT_DOC and game.last_cmd_result:
             self.history.append((self.pending_cmd or "读取文档", game.last_cmd_result))
             self.pending_cmd = None
         elif self.mode == self.WAIT_CMD and game.last_cmd_result:
@@ -177,25 +170,13 @@ class TaskEngine:
     def _advance(self, game: GameState, pioneer: Role) -> tuple[dict | None, str | None, str]:
         phase = game.phase_task
 
-        if self.mode == self.FIND_FILE:
+        if self.mode == self.READ_DOC:
             fname = _extract_md_filename(phase)
             if fname is None:
                 # 无明确文件名，直接兜底读取（只输出内容）
                 cmd = self._glob_read_cmd()
-                self.pending_cmd = cmd
-                self.mode = self.WAIT_DOC
-                return None, cmd, ""
-            cmd = self._find_cmd(fname)
-            self.pending_cmd = cmd
-            self.mode = self.WAIT_FIND
-            return None, cmd, ""
-
-        if self.mode == self.WAIT_FIND:
-            # 已定位到路径（在 step 中解析），再读取内容
-            if self.doc_path:
-                cmd = self._read_cmd(self.doc_path)
             else:
-                cmd = self._glob_read_cmd()
+                cmd = self._read_doc_cmd(fname)
             self.pending_cmd = cmd
             self.mode = self.WAIT_DOC
             return None, cmd, ""
@@ -244,38 +225,25 @@ class TaskEngine:
         return _PROMPT_TEMPLATE.format(task=self.task_desc, context=context)
 
     @staticmethod
-    def _find_cmd(fname: str) -> str:
-        """定位文件路径：只打印路径、抑制 stderr、找到即停。
+    def _read_doc_cmd(fname: str) -> str:
+        """一条命令直接读出文档内容：多路径定位 + 兜底全盘查找 + cat。
 
-        ``-xdev`` 不跨文件系统（避免陷进 /proc、/sys 等），``-maxdepth 4`` 限制深度，
-        防止无界遍历海量目录树导致沙盒 15 秒超时。
+        先在常见目录（含当前工作目录）里用 ``find -H`` 找文件名，找不到再全盘
+        ``find -H /`` 兜底，命中后 ``cat`` 输出内容；全程抑制 stderr，避免
+        ``permission denied`` 等中间产物混入 ``lastCmdResult``。
         """
         base = fname.rsplit("/", 1)[-1]
-        return f"find . -xdev -maxdepth 4 -name '{base}' -print -quit 2>/dev/null"
-
-    @staticmethod
-    def _read_cmd(path: str) -> str:
-        """读取已定位的文件内容，只输出内容。"""
-        return f"cat '{path}' 2>/dev/null"
+        return (
+            'f=$(find -H /tmp /home /root /opt /srv /data /workspace "$(pwd)" '
+            f"-name '{base}' 2>/dev/null | head -1); "
+            f"[ -n \"$f\" ] || f=$(find -H / -name '{base}' 2>/dev/null | head -1); "
+            'cat "$f"'
+        )
 
     @staticmethod
     def _glob_read_cmd() -> str:
         """兜底：无明确文件名时，只输出 CWD 下 md/txt 内容，不带 ls/pwd 等中间产物。"""
         return 'for f in *.md *.txt; do [ -f "$f" ] && cat "$f"; done 2>/dev/null'
-
-    @staticmethod
-    def _parse_path(result: str) -> str | None:
-        """从 find 输出里提取文件路径，过滤 permission denied 等干扰行。"""
-        if not result:
-            return None
-        for ln in result.splitlines():
-            ln = ln.strip()
-            if not ln or ln.startswith("["):
-                continue
-            if "permission denied" in ln.lower() or ln.startswith("find:"):
-                continue
-            return ln
-        return None
 
     @staticmethod
     def _has_answer_error(game: GameState) -> bool:
