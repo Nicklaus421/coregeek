@@ -32,36 +32,48 @@ ROBOT_VALUE = {
 }
 
 
-class BuildPlan:
-    """围绕基地的固定建造蓝图：距离 1 圈放塔，距离 2 圈放围墙（留背敌出入口）。"""
+def attack_corner(base_cells: list[Pos], w: int, h: int) -> Pos:
+    """推断机器人来袭角（地图四个角落之一）。
 
-    def __init__(self, base_cells: list[Pos], enemy_station: Pos | None, w: int, h: int):
+    基地固定在左上角或右下角：左上角基地被右上角来的机器人攻击，右下角基地被左下角攻击。
+    即来袭角 = 与基地同处一条水平带（顶/底）、但 x 镜像到对侧的角落。
+    """
+    cx = sum(p.x for p in base_cells) / len(base_cells)
+    cy = sum(p.y for p in base_cells) / len(base_cells)
+    ax = w - 1 if cx < w / 2 else 0
+    ay = h - 1 if cy > h / 2 else 0
+    return Pos(ax, ay)
+
+
+class BuildPlan:
+    """围绕基地的固定建造蓝图：距离 1 圈放塔，距离 2 圈放围墙。
+
+    围墙从来袭方向（attack_corner）优先建，背敌一侧留出入口供角色进出。
+    """
+
+    def __init__(self, base_cells: list[Pos], w: int, h: int):
         self.base_cells = base_cells
-        self.enemy = enemy_station
+        self.attack = attack_corner(base_cells, w, h)
         self.ring1 = geo.ring_cells(base_cells, 1, w, h)
         self.ring2 = geo.ring_cells(base_cells, 2, w, h)
         self.tower_sites = self._pick_towers()
         self.wall_order = self._wall_order()
 
     def _pick_towers(self) -> list[Pos]:
+        # 塔靠近来袭面摆放（火箭射程全图，摆位用于阻挡机器人）
         ring = list(self.ring1)
-        if self.enemy is not None:
-            ring.sort(key=lambda p: geo.cheb(p, self.enemy))
+        ring.sort(key=lambda p: geo.cheb(p, self.attack))
         return ring[: len(TOWER_LOADOUT)]
 
     def _wall_order(self) -> list[Pos]:
         ring = list(self.ring2)
         if not ring:
             return []
-        if self.enemy is not None:
-            # 背敌一侧（离敌方最远的 ring2 格）留作出入口
-            entrance = max(ring, key=lambda p: geo.cheb(p, self.enemy))
-        else:
-            entrance = ring[0]
+        # 背敌一侧（离来袭角最远的 ring2 格）留作出入口
+        entrance = max(ring, key=lambda p: geo.cheb(p, self.attack))
         order = [p for p in ring if p.key() != entrance.key()]
-        if self.enemy is not None:
-            # 从近敌一侧开始围，先把受攻击面封住
-            order.sort(key=lambda p: geo.cheb(p, self.enemy))
+        # 从近敌一侧开始围，先把受攻击面封住
+        order.sort(key=lambda p: geo.cheb(p, self.attack))
         return order
 
 

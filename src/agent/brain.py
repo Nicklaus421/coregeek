@@ -1,6 +1,6 @@
 """Agent 决策核心。
 
-- 白天：工人建造（三火箭塔 + 围墙圈）、采集、贩卖、买/用升级券；开拓者做自进化任务。
+- 白天：工人优先采石头建围墙（防御），再建塔、买/用升级券（武器优先）、采集贩卖；开拓者做自进化任务。
 - 夜晚：角色操控火箭塔攻击机器人；开拓者若任务进行中则继续做任务。
 
 每回合每个角色至多一条指令；attack 指令的 key 为武器 id，``controllerId`` 为操控角色 id。
@@ -33,6 +33,8 @@ class Agent:
         self._plan: BuildPlan | None = None
         self._plan_key: tuple | None = None
         self.task_engine = TaskEngine()
+        # worker_id -> (ore, mine_pos_key)：持久化采矿目标，避免远距离路径摇摆
+        self._mine_targets: dict[int, tuple[str, tuple[int, int]]] = {}
 
     # ---- 入口 ----
     def decide(self, payload: dict) -> dict:
@@ -67,10 +69,9 @@ class Agent:
             self._plan = None
             self._plan_key = None
             return
-        enemy = game.enemy_station
-        key = (tuple(sorted(c.key() for c in base)), enemy.pos.key() if enemy else None)
+        key = tuple(sorted(c.key() for c in base))
         if self._plan_key != key:
-            self._plan = BuildPlan(base, enemy.pos if enemy else None, game.width, game.height)
+            self._plan = BuildPlan(base, game.width, game.height)
             self._plan_key = key
 
     # ---- 白天 ----
@@ -78,26 +79,32 @@ class Agent:
         cmds: dict[int, dict] = {}
         claimed: set[tuple[int, int]] = set()
         retreat = game.rounds_until_night <= 12
+        # 撤离时按稳定分配去各自的塔，避免多人挤同一塔
+        tower_for: dict[int, Role] = {}
+        if retreat:
+            for w, tower in self._assign_workers_to_towers(game):
+                tower_for[w.id] = tower
         for w in game.workers:
-            cmd = self._day_worker(game, w, claimed, retreat)
+            cmd = self._day_worker(game, w, claimed, retreat, tower_for.get(w.id))
             if cmd is not None:
                 cmds[w.id] = cmd
         return cmds
 
-    def _day_worker(self, game: GameState, w: Role, claimed: set, retreat: bool) -> dict | None:
+    def _day_worker(
+        self, game: GameState, w: Role, claimed: set, retreat: bool, tower: Role | None
+    ) -> dict | None:
         # 血量低且有药 -> 回血
         heal = self._heal(game, w)
         if heal is not None:
             return heal
 
-        # 临近夜晚 -> 撤回最近的塔旁待命
+        # 临近夜晚 -> 撤回各自分配的塔旁待命
         if retreat:
-            tower = self._nearest_tower(game, w)
             if tower is not None and geo.cheb(w.pos, tower.pos) > 1:
                 return self._move_adjacent(game, w, tower.pos)
             return None
 
-        # 1. 建造塔
+        # 1. 建满 3 座塔
         site = self._unbuilt_tower_site(game, claimed)
         if site is not None:
             if geo.cheb(w.pos, site) <= 1:
@@ -105,7 +112,7 @@ class Agent:
                 return {"action": "build", "name": ROCKET, "targetPos": [site.to_dict()]}
             return self._move_adjacent(game, w, site)
 
-        # 2. 建造围墙（需要石头）
+        # 2. 建围墙（需采石头，从来袭方向开始）
         wall = self._unbuilt_wall(game, claimed)
         if wall is not None:
             if not self._has_item(w, "stone"):
@@ -115,12 +122,12 @@ class Agent:
                 return {"action": "build", "name": "wall", "targetPos": [wall.to_dict()]}
             return self._move_adjacent(game, w, wall)
 
-        # 3. 升级流程（买券 / 用券）
+        # 3. 升级流程（武器优先）
         cmd = self._upgrade_flow(game, w, claimed)
         if cmd is not None:
             return cmd
 
-        # 4. 采集 + 贩卖攒金币
+        # 4. 采集 + 贩卖攒金币（石头优先）
         cmd = self._collect_sell(game, w, claimed)
         if cmd is not None:
             return cmd
@@ -131,18 +138,21 @@ class Agent:
     def _night_plan(self, game: GameState) -> dict:
         cmds: dict[int, dict] = {}
         towers = game.towers
-        operators = list(game.workers)
+
+        # 工人 → 塔稳定分配（与白天撤离一致）
+        pairs = self._assign_workers_to_towers(game)
+        used = {t.id for _, t in pairs}
+        # 开拓者没在任务中时，补位剩余塔
         if game.pioneer is not None and not game.phase_task:
-            operators.append(game.pioneer)
+            remaining = [t for t in towers if t.id not in used]
+            if remaining:
+                pairs.append((game.pioneer, remaining[0]))
 
         # 优先攻击威胁我方基地的机器人，无则攻击所有机器人刷分
         threats = [r for r in game.robots if r.target_team == game.team_type]
         target_pool = threats if threats else game.robots
 
-        for i, tower in enumerate(towers):
-            if i >= len(operators):
-                break
-            op = operators[i]
+        for op, tower in pairs:
             if geo.cheb(op.pos, tower.pos) <= 1:
                 if tower.cooldown <= 0:
                     target = choose_rocket_target(target_pool)
@@ -183,11 +193,18 @@ class Agent:
             return {"action": "use", "name": item}
         return None
 
-    def _nearest_tower(self, game: GameState, role: Role) -> Role | None:
-        towers = game.towers
-        if not towers:
-            return None
-        return min(towers, key=lambda t: geo.cheb(role.pos, t.pos))
+    def _assign_workers_to_towers(self, game: GameState) -> list[tuple[Role, Role]]:
+        """把工人贪心分配到塔（每塔就近选未分配的工人），白天撤离与夜晚操控共用，保证稳定不摇摆。"""
+        towers = list(game.towers)
+        available = list(game.workers)
+        pairs: list[tuple[Role, Role]] = []
+        for tower in towers:
+            if not available:
+                break
+            w = min(available, key=lambda o: geo.cheb(o.pos, tower.pos))
+            available.remove(w)
+            pairs.append((w, tower))
+        return pairs
 
     def _unbuilt_tower_site(self, game: GameState, claimed: set) -> Pos | None:
         if self._plan is None:
@@ -208,13 +225,31 @@ class Agent:
         return None
 
     def _go_collect(self, game: GameState, w: Role, ore: str, claimed: set) -> dict | None:
-        mine = self._nearest_mine(game, w, ore, claimed)
+        mine = self._select_mine(game, w, ore, claimed)
         if mine is None:
             return None
         claimed.add(mine.pos.key())
         if geo.cheb(w.pos, mine.pos) <= 1:
             return {"action": "collect", "targetPos": [mine.pos.to_dict()]}
         return self._move_adjacent(game, w, mine.pos)
+
+    def _mine_at(self, game: GameState, ore: str, key: tuple[int, int]) -> Zone | None:
+        for z in game.mines:
+            if z.neutral_type == ore and z.pos.key() == key:
+                return z
+        return None
+
+    def _select_mine(self, game: GameState, w: Role, ore: str, claimed: set) -> Zone | None:
+        """选矿：远距离时锁定同一矿（持久目标）避免来回摇摆；到矿旁后自然就近采。"""
+        t = self._mine_targets.get(w.id)
+        if t is not None and t[0] == ore:
+            mine = self._mine_at(game, ore, t[1])
+            if mine is not None and t[1] not in claimed and geo.cheb(w.pos, mine.pos) > 1:
+                return mine
+        mine = self._nearest_mine(game, w, ore, claimed)
+        if mine is not None:
+            self._mine_targets[w.id] = (ore, mine.pos.key())
+        return mine
 
     def _nearest_mine(self, game: GameState, w: Role, ore: str, claimed: set) -> Zone | None:
         mines = [z for z in game.mines if z.neutral_type == ore and z.pos.key() not in claimed]
@@ -231,7 +266,7 @@ class Agent:
             if geo.cheb(w.pos, vendor.pos) <= 1:
                 return {"action": "sell", "name": ore, "num": self._item_count(w, ore)}
             return self._move_adjacent(game, w, vendor.pos)
-        for ore in ("copper", "iron", "stone"):
+        for ore in ("stone", "copper", "iron"):
             if self._nearest_mine(game, w, ore, claimed) is not None:
                 return self._go_collect(game, w, ore, claimed)
         return None
