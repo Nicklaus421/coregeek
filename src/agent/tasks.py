@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import difflib
 import re
 
 from . import geometry as geo
@@ -118,21 +119,36 @@ class TaskEngine:
     WAIT_DOC = "wait_doc"      # 已发读文档命令，等 lastCmdResult（文件内容）
     WAIT_LLM = "wait_llm"      # 已发 prompt，等 llmResp
     WAIT_CMD = "wait_cmd"      # 已发 executeCmd，等 lastCmdResult
+    REPLAY = "replay"          # 复用已记录的 SOP：逐回合重放命令，无需重新探索
     DONE = "done"              # 已提交答案
 
     def __init__(self) -> None:
         self.mode = self.IDLE
         self.task_desc = ""
+        self.task_type = ""
         self.history: list[tuple[str, str]] = []
         self.pending_cmd: str | None = None
         self.answer: str | None = None
+        # SOP 缓存：task_type -> {"commands": [...], "task": 首次任务原文}
+        # 首次成功解出某类任务后记录，后续同类任务直接重放命令（可跨回合/复活持久）。
+        self.sop: dict[str, dict] = {}
+        # 当前任务首次求解中已发出的命令序列（用于成功后固化为 SOP）
+        self._recorded_cmds: list[str] = []
+        # 重放态：待重放的命令序列与进度
+        self._replay_cmds: list[str] = []
+        self._replay_idx = 0
 
     def reset(self) -> None:
+        """清空当前任务的瞬时状态，但保留已固化的 SOP 缓存。"""
         self.mode = self.IDLE
         self.task_desc = ""
+        self.task_type = ""
         self.history = []
         self.pending_cmd = None
         self.answer = None
+        self._recorded_cmds = []
+        self._replay_cmds = []
+        self._replay_idx = 0
 
     def step(self, game: GameState) -> tuple[dict | None, str | None, str]:
         """返回 (开拓者指令, executeCmd, prompt)。"""
@@ -141,25 +157,43 @@ class TaskEngine:
             return None, None, ""
         phase = game.phase_task
 
-        # 无任务进行中：前往接取
+        # 无任务进行中：提交上一任务 SOP（若成功），前往接取
         if not phase:
+            self._commit_sop()
             self.reset()
             cmd, _, _ = self._go_accept(game, pioneer)
             return cmd, None, ""
 
         # 新任务开始
         if phase != self.task_desc:
+            self._commit_sop()
+            self.task_type = self._current_task_type(game, pioneer)
             self.task_desc = phase
             self.history = []
             self.pending_cmd = None
             self.answer = None
-            self.mode = self.READ_DOC
+            self._recorded_cmds = []
+            self._replay_cmds = []
+            self._replay_idx = 0
+            if self.task_type in self.sop:
+                # 已存在 SOP：直接重放（命令按新任务原文做参数替换）
+                self._replay_cmds = self._substitute_commands(
+                    self.sop[self.task_type]["commands"],
+                    self.sop[self.task_type]["task"],
+                    phase,
+                )
+                self.mode = self.REPLAY
+            else:
+                self.mode = self.READ_DOC
 
         # 累积本回合回传的结果
         if self.mode == self.WAIT_DOC and game.last_cmd_result:
             self.history.append((self.pending_cmd or "读取文档", game.last_cmd_result))
             self.pending_cmd = None
         elif self.mode == self.WAIT_CMD and game.last_cmd_result:
+            self.history.append((self.pending_cmd or "", game.last_cmd_result))
+            self.pending_cmd = None
+        elif self.mode == self.REPLAY and game.last_cmd_result:
             self.history.append((self.pending_cmd or "", game.last_cmd_result))
             self.pending_cmd = None
         elif self.mode == self.WAIT_LLM:
@@ -178,6 +212,7 @@ class TaskEngine:
             else:
                 cmd = self._read_doc_cmd(fname)
             self.pending_cmd = cmd
+            self._recorded_cmds.append(cmd)
             self.mode = self.WAIT_DOC
             return None, cmd, ""
 
@@ -193,6 +228,7 @@ class TaskEngine:
                 return {"action": "submitAnswer", "taskAnswer": ans}, None, ""
             if cmd is not None:
                 self.pending_cmd = cmd
+                self._recorded_cmds.append(cmd)
                 self.mode = self.WAIT_CMD
                 return None, cmd, ""
             # 大模型未给出可执行指令，重新询问
@@ -200,6 +236,15 @@ class TaskEngine:
 
         if self.mode == self.WAIT_CMD:
             # 命令结果已回（在 step 中已累积），交给大模型
+            return self._send_prompt()
+
+        if self.mode == self.REPLAY:
+            # 逐回合重放已记录的 SOP 命令，全部放完后再用一次 prompt 收敛答案
+            if self._replay_idx < len(self._replay_cmds):
+                cmd = self._replay_cmds[self._replay_idx]
+                self._replay_idx += 1
+                self.pending_cmd = cmd
+                return None, cmd, ""
             return self._send_prompt()
 
         if self.mode == self.DONE:
@@ -213,6 +258,60 @@ class TaskEngine:
         return None, None, ""
 
     # ---- 辅助 ----
+    def _commit_sop(self) -> None:
+        """首次成功解出某类任务后，把命令序列固化为该类型的 SOP。
+
+        仅记录首次（``task_type`` 尚不在 ``sop`` 中）；后续重放成功不会覆盖，
+        避免把「重放 + 一次 prompt」的过程误当成全新探索流程写回。
+        """
+        if (
+            self.task_type
+            and self.task_type not in self.sop
+            and self.answer is not None
+            and self._recorded_cmds
+        ):
+            self.sop[self.task_type] = {
+                "commands": list(self._recorded_cmds),
+                "task": self.task_desc,
+            }
+
+    @staticmethod
+    def _current_task_type(game: GameState, pioneer: Role) -> str:
+        """推断开拓者当前接取的是哪类自进化任务。
+
+        任务执行期间开拓者须停留在任务点一格内，据此用 ``player_tasks`` 里与
+        开拓者相邻的任务点匹配 ``taskType``；匹配不到则回退到最近的自进化任务点。
+        """
+        se_types = ("自进化类1", "自进化类2")
+        se = [t for t in game.player_tasks if t.task_type in se_types]
+        for t in se:
+            if geo.cheb(t.task_position, pioneer.pos) <= 1:
+                return t.task_type
+        if not se:
+            return ""
+        return min(se, key=lambda t: geo.cheb(t.task_position, pioneer.pos)).task_type
+
+    @staticmethod
+    def _substitute_commands(commands: list[str], old_task: str, new_task: str) -> list[str]:
+        """把 SOP 命令里与旧任务绑定的参数替换成新任务的参数。
+
+        用 difflib 定位旧任务原文与新任务原文的差异片段（如「北京」→「上海」），
+        再将差异片段在每条命令中做字符串替换，使重放的命令作用于新任务目标。
+        """
+        if not old_task or old_task == new_task:
+            return list(commands)
+        subs: list[tuple[str, str]] = []
+        sm = difflib.SequenceMatcher(a=old_task, b=new_task)
+        for op, i1, i2, j1, j2 in sm.get_opcodes():
+            if op == "replace":
+                subs.append((old_task[i1:i2], new_task[j1:j2]))
+        out: list[str] = []
+        for c in commands:
+            for old, new in subs:
+                c = c.replace(old, new)
+            out.append(c)
+        return out
+
     def _send_prompt(self) -> tuple[None, None, str]:
         self.mode = self.WAIT_LLM
         return None, None, self._build_prompt()

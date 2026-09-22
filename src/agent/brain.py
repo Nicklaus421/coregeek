@@ -30,6 +30,9 @@ MAX_HP = {"worker": 220, "pioneer": 200}
 # 建围墙前单次采石目标：攒够这一批再回基地建墙，避免一石一返的低效往返。
 STONE_BATCH = 10
 
+# 贩卖前单次采集目标：采满一个矿点（10 单位）再卖，避免采一个卖一个的低效往返。
+SELL_BATCH = 10
+
 # 机器人攻击距离：夜晚角色要远离机器人的安全圈半径
 ROBOT_DANGER_RANGE = 3
 
@@ -318,9 +321,15 @@ class Agent:
         # 已在危险区 -> 先逃命
         if w.pos.key() in danger:
             return self._flee_robots(game, w)
-        # 有矿可卖 -> 去小贩（小贩危险则暂不前往）
+        # 有矿可卖 -> 采满一个矿点再卖；未满且该矿安全可采则继续采，否则去小贩
         ore = self._ore_to_sell(game, w)
         if ore is not None:
+            if self._item_count(w, ore) < SELL_BATCH and self._mine_exists(game, ore):
+                mine = self._nearest_safe_mine(game, w, ore, danger)
+                if mine is not None:
+                    if geo.cheb(w.pos, mine.pos) <= 1:
+                        return {"action": "collect", "targetPos": [mine.pos.to_dict()]}
+                    return self._move_adjacent(game, w, mine.pos)
             vendor = game.vendor
             if vendor is None:
                 return None
@@ -451,9 +460,16 @@ class Agent:
             return None
         return min(mines, key=lambda z: geo.cheb(w.pos, z.pos))
 
+    @staticmethod
+    def _mine_exists(game: GameState, ore: str) -> bool:
+        return any(z.neutral_type == ore for z in game.mines)
+
     def _collect_sell(self, game: GameState, w: Role, claimed: set) -> dict | None:
         ore = self._ore_to_sell(game, w)
         if ore is not None:
+            # 采满一个矿点（或该矿已枯竭）才去卖，避免采一个卖一个
+            if self._item_count(w, ore) < SELL_BATCH and self._mine_exists(game, ore):
+                return self._go_collect(game, w, ore)
             vendor = game.vendor
             if vendor is None:
                 return None
